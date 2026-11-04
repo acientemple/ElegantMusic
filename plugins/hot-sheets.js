@@ -1,20 +1,29 @@
 /**
- * 音乐排行榜 —— 网易云音乐聚合插件
+ * 热门歌单 —— 网易云音乐聚合插件
  *
- * 提供：排行榜 / 歌单详情 / 在线播放 / 搜索 / 歌词 / 歌单导入
- * 平台标识：音乐排行榜
+ * 覆盖 MusicFree「热门歌单」页：标签分组 / 歌单列表 / 歌单详情 / 在线播放 / 歌词 / 搜索 / 歌单导入
+ * 平台标识：热门歌单
  */
 
 const axios = require('axios');
 
-const PLATFORM = '音乐排行榜';
+const PLATFORM = '热门歌单';
 const API_HOST = 'https://music.163.com';
 
+const SHEET_PAGE_SIZE = 50;
+const TRACK_PAGE_SIZE = 50;
 const SEARCH_PAGE_SIZE = 30;
-const DETAIL_PAGE_SIZE = 50;
 
 const USER_AGENT =
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36';
+
+// 网易云 Web 接口在缺少客户端标识时只吐出 10 首歌，
+// 带上 os / appver 才会返回完整歌单。
+const CLIENT_COOKIE = { os: 'pc', appver: '2.9.7' };
+
+// 主进程在 rawLrc 与 translation 同时为空时会返回 null，
+// 渲染层随后读取 null.rawLrc 抛错，故用占位歌词兜底。
+const NO_LYRIC_LRC = '[00:00.00]暂无歌词';
 
 const QUALITY_BITRATE = {
     low: 64000,
@@ -24,14 +33,6 @@ const QUALITY_BITRATE = {
 };
 
 const QUALITY_ORDER = ['low', 'standard', 'high', 'super'];
-
-// 网易云 Web 接口在缺少客户端标识时只吐出 10 首歌，
-// 带上 os / appver 才会返回完整歌单。
-const CLIENT_COOKIE = { os: 'pc', appver: '2.9.7' };
-
-// 主进程在 rawLrc 与 translation 同时为空时会返回 null，
-// 渲染层随后读取 null.rawLrc 抛错，故用占位歌词兜底。
-const NO_LYRIC_LRC = '[00:00.00]暂无歌词';
 
 const SEARCH_TYPE = {
     music: 1,
@@ -43,24 +44,286 @@ const SEARCH_TYPE = {
     lyric: 1,
 };
 
-const OFFICIAL_CHART_IDS = ['19723756', '3779629', '2884035', '3778678'];
-
-const GLOBAL_CHART_KEYWORDS = [
-    'Billboard',
-    'Oricon',
-    'NRJ',
-    'Beatport',
-    'UK排行榜',
-    '韩语榜',
-    '日语榜',
-    '俄语榜',
-    '越南语榜',
-    '泰语榜',
-    '俄罗斯',
-    '欧美',
-    'R&B',
-    '全球说唱',
+// 歌单分类，分组与分类名取自 music.163.com/discover/playlist 的官方分类栏，
+// 全部为实测有效、且各自返回独立结果的分类名
+const TAG_GROUPS = [
+    {
+        title: '语种',
+        data: ['华语', '欧美', '日韩', '日语', '韩语', '粤语'],
+    },
+    {
+        title: '风格',
+        data: [
+            '流行', '摇滚', '民谣', '电子', '轻音乐', '古典', '乡村',
+            '说唱', '爵士', '金属', '朋克', '拉丁',
+        ],
+    },
+    {
+        title: '场景',
+        data: [
+            '夜晚', '学习', '工作', '午休', '下午茶', '地铁',
+            '驾车', '散步', '旅行', '酒吧', '运动',
+        ],
+    },
+    {
+        title: '情感',
+        data: ['伤感', '快乐', '孤独', '思念', '治愈', '安静'],
+    },
+    {
+        title: '主题',
+        data: ['经典', '影视原声', '游戏', 'ACG', '儿童'],
+    },
 ];
+
+// 网易云没有「日韩」这个分类，接口只认单个官方分类名，
+// 多值（如 cat=日语,韩语）会被当成无效分类返回无关结果，
+// 因此这里合并「日语」「韩语」两个官方分类自行实现
+const COMPOSITE_TAGS = {
+    日韩: ['日语', '韩语'],
+};
+
+const PINNED_TAGS = ['华语', '流行', '摇滚', '民谣', '电子'];
+
+
+/* ---------------------------- 跨源歌词兜底 ---------------------------- */
+
+// 网易云没有收录这首歌、或这首歌没有歌词时，改从 QQ 音乐与 LRCLIB 取词
+const FALLBACK_TIMEOUT = 6000;
+/** LRCLIB 常年不稳定，给它更短的超时，别拖累整体取词速度 */
+const LRCLIB_TIMEOUT = 3000;
+
+// 归一化歌名 / 歌手：去掉大小写、空白与标点
+function fallbackKey(text) {
+    return String(text || '')
+        .toLowerCase()
+        .replace(/[\s·・\-_~,，。!！?？'"“”]/g, '');
+}
+
+// 去掉括号里的修饰（Live / DJ版 / 官方版…）
+function fallbackLooseKey(text) {
+    return fallbackKey(text).replace(/[（(\[【《][^）)\]】》]*[）)\]】》]/g, '');
+}
+
+/** 带时间轴的行数，带时间轴的歌词才用得上 */
+function countLyricTimedLines(lrc) {
+    return String(lrc || '')
+        .split(/\r?\n/)
+        .filter((line) => /\[\d{1,3}:\d{1,2}([.:]\d{1,3})?\]/.test(line))
+        .length;
+}
+
+/** 至少两行带时间轴、且不是「暂无歌词」才算有用的歌词 */
+function isUsableLyric(lrc) {
+    if (countLyricTimedLines(lrc) < 2) {
+        return false;
+    }
+    return !/暂无(歌词|字幕)|歌词不存在|no\s*lyrics?/i.test(lrc);
+}
+
+/** 歌名与歌手都对得上才算命中，歌名完全一致优先于带修饰的版本 */
+function songMatchScore(candidateTitle, candidateArtist, title, artist) {
+    const ct = fallbackKey(candidateTitle);
+    const nt = fallbackKey(title);
+    if (!ct || !nt) {
+        return 0;
+    }
+    let score = 0;
+    if (ct === nt) {
+        score += 4;
+    } else if (fallbackLooseKey(candidateTitle) === fallbackLooseKey(title)) {
+        score += 3;
+    } else if (fallbackLooseKey(candidateTitle).includes(fallbackLooseKey(title))) {
+        score += 1;
+    }
+    const ca = fallbackKey(candidateArtist);
+    const na = fallbackKey(artist);
+    if (na && ca) {
+        if (ca === na) {
+            score += 3;
+        } else if (ca.includes(na) || na.includes(ca)) {
+            score += 2;
+        }
+    }
+    return score;
+}
+
+async function fallbackGet(url, params, headers, timeout) {
+    const response = await axios.get(url, {
+        params: params || {},
+        headers: { 'user-agent': USER_AGENT, ...(headers || {}) },
+        timeout: timeout || FALLBACK_TIMEOUT,
+    });
+    return response.data;
+}
+
+/** 在 QQ 音乐里按歌名找原唱并取回歌词 */
+async function fetchQQLyricByName(title, artist) {
+    const query = [title, artist].filter(Boolean).join(' ').trim();
+    if (!query) {
+        return [];
+    }
+    const data = await fallbackGet(
+        'https://c.y.qq.com/soso/fcgi-bin/client_search_cp',
+        { p: 1, n: 10, w: query, format: 'json' },
+        { referer: 'https://y.qq.com/' },
+    );
+    const list = (data && data.data && data.data.song && data.data.song.list) || [];
+    const ranked = list
+        .map((song) => {
+            const singer = (song.singer || [])
+                .map((item) => item && item.name)
+                .filter(Boolean)
+                .join(' / ');
+            return {
+                songmid: song.songmid,
+                score: songMatchScore(song.songname || '', singer, title, artist),
+            };
+        })
+        .filter((item) => item.songmid)
+        .sort((a, b) => b.score - a.score);
+    const results = [];
+    for (const item of ranked.slice(0, 2)) {
+        // 歌名与歌手都对不上的候选直接跳过
+        if (item.score < 4) {
+            break;
+        }
+        try {
+            const lyric = await fallbackGet(
+                'https://c.y.qq.com/lyric/fcgi-bin/fcg_query_lyric_new.fcg',
+                { songmid: item.songmid, format: 'json', nobase64: 1, g_tk: 5381 },
+                { referer: 'https://y.qq.com/' },
+            );
+            if (Number(lyric && lyric.code) === 0 && lyric && lyric.lyric) {
+                results.push({
+                    rawLrc: lyric.lyric,
+                    translation: lyric.trans || '',
+                    match: item.score,
+                });
+            }
+        } catch (e) {
+            // 这条取不到就试下一条
+        }
+    }
+    return results;
+}
+
+/** LRCLIB 只能按「歌名 + 歌手」取词 */
+async function fetchLrclibLyricByName(title, artist) {
+    if (!title) {
+        return [];
+    }
+    try {
+        const data = await fallbackGet(
+            'https://lrclib.net/api/get',
+            { track_name: title, artist_name: artist || '' },
+            { referer: 'https://lrclib.net/' },
+            LRCLIB_TIMEOUT,
+        );
+        const rawLrc = (data && (data.syncedLyrics || data.plainLyrics)) || '';
+        if (rawLrc) {
+            // 按歌名与歌手精确取回的，匹配度按满计算
+            return [{ rawLrc, translation: '', match: 7 }];
+        }
+    } catch (e) {
+        // 取不到就当没有
+    }
+    return [];
+}
+
+/** 歌词里出现大量非常用字符，说明这份歌词的编码不对 */
+function garbledRatio(lrc) {
+    const chars = String(lrc || '').replace(/\s/g, '');
+    if (!chars) {
+        return 0;
+    }
+    let bad = 0;
+    for (const ch of chars) {
+        const code = ch.codePointAt(0);
+        const normal =
+            code < 128 ||
+            (code >= 0x4e00 && code <= 0x9fff) ||
+            (code >= 0x3000 && code <= 0x303f) ||
+            (code >= 0xff00 && code <= 0xffef) ||
+            (code >= 0x2010 && code <= 0x206f);
+        if (!normal) {
+            bad += 1;
+        }
+    }
+    return bad / chars.length;
+}
+
+/** 去掉 [ti:] [ar:] 这类头部信息，坏编码时它们会显示成乱码 */
+function cleanLyricHeader(lrc) {
+    return String(lrc || '')
+        .split(/\r?\n/)
+        .filter((line) => !/^\s*\[(ti|ar|al|by)\s*:/i.test(line))
+        .join('\n');
+}
+
+/**
+ * 挑一份最好的歌词：
+ * 先看是不是同一首歌（匹配度），再看歌词本身是否完整。
+ * 只按行数挑会选到 DJ 版、变速版这类行数更多却不是原版的歌词
+ */
+function pickBestLyric(list) {
+    let best = null;
+    let bestScore = -1;
+    (list || []).forEach((item) => {
+        if (!item || !isUsableLyric(item.rawLrc)) {
+            return;
+        }
+        let score = (item.match || 0) * 100;
+        score += Math.min(countLyricTimedLines(item.rawLrc), 60);
+        if (item.translation && item.translation.trim()) {
+            score += 25;
+        }
+        score -= Math.round(garbledRatio(item.rawLrc) * 100);
+        if (score > bestScore) {
+            bestScore = score;
+            best = {
+                rawLrc: cleanLyricHeader(item.rawLrc),
+                translation: item.translation || '',
+            };
+        }
+    });
+    return best;
+}
+
+/** 网易云没有歌词时的跨源兜底：先用 QQ，QQ 没有再用 LRCLIB */
+async function fetchFallbackLyric(title, artist) {
+    if (!title) {
+        return null;
+    }
+    const qqResults = await fetchQQLyricByName(title, artist).catch(() => []);
+    const fromQQ = pickBestLyric(qqResults);
+    if (fromQQ) {
+        return fromQQ;
+    }
+    const lrclibResults = await fetchLrclibLyricByName(title, artist).catch(() => []);
+    return pickBestLyric(lrclibResults);
+}
+
+/** 关联歌词后拿不到歌名时，用网易云的详情接口反查 */
+async function resolveSongName(musicItem) {
+    let title = String((musicItem && musicItem.title) || '').trim();
+    let artist = String((musicItem && musicItem.artist) || '').trim();
+    if ((title && artist) || !(musicItem && musicItem.id)) {
+        return { title, artist };
+    }
+    try {
+        const data = await request('/api/song/detail', {
+            ids: '[' + musicItem.id + ']',
+        });
+        const song = (data && data.songs && data.songs[0]) || null;
+        if (song) {
+            title = title || song.name || '';
+            artist = artist || pickArtistName(song);
+        }
+    } catch (e) {
+        // 反查不到就用现有信息
+    }
+    return { title, artist };
+}
 
 function toHttps(url) {
     return typeof url === 'string' ? url.replace(/^http:\/\//, 'https://') : url;
@@ -303,12 +566,46 @@ async function fetchPlaylistDetail(id) {
     return pickPlaylist(detail);
 }
 
-function paginate(list, page, pageSize) {
+// 合并分类：接口不支持多分类查询，只能分别取各官方分类再交错合并
+async function fetchCompositeSheets(cats, page) {
     const current = Math.max(1, Number(page) || 1);
-    const start = (current - 1) * pageSize;
+    const perCatLimit = Math.ceil(SHEET_PAGE_SIZE / cats.length);
+    const offset = (current - 1) * perCatLimit;
+    const results = await Promise.all(
+        cats.map((cat) =>
+            request('/api/playlist/list', {
+                order: 'hot',
+                limit: perCatLimit,
+                offset,
+                cat,
+            }),
+        ),
+    );
+    const lists = results.map((result) => result?.playlists || []);
+    const merged = [];
+    const seen = new Set();
+    const longest = Math.max(...lists.map((list) => list.length));
+    for (let i = 0; i < longest; i++) {
+        for (const list of lists) {
+            const playlist = list[i];
+            if (!playlist?.id) {
+                continue;
+            }
+            const id = String(playlist.id);
+            if (seen.has(id)) {
+                continue;
+            }
+            seen.add(id);
+            merged.push(playlist);
+        }
+    }
+    const isEnd = results.every((result, index) => {
+        const total = Number(result?.total) || 0;
+        return lists[index].length === 0 || offset + lists[index].length >= total;
+    });
     return {
-        musicList: list.slice(start, start + pageSize),
-        isEnd: start + pageSize >= list.length,
+        data: merged.map(toSheetItem).filter(Boolean),
+        isEnd,
     };
 }
 
@@ -352,12 +649,14 @@ function extractResourceId(input) {
 
 module.exports = {
     platform: PLATFORM,
-    version: '1.0.0',
+    version: '1.2.0',
     author: 'MusicFree',
-    module: '榜单',
-    defaultSearchType: 'music',
+    description: '网易云音乐热门歌单：标签分类浏览、完整歌单曲目、在线播放与歌词',
+    cacheControl: 'no-cache',
     // lyric 走歌曲检索（SEARCH_TYPE.lyric = 1），选中后由 getLyric 取回歌词
     supportedSearchType: ['music', 'album', 'artist', 'sheet', 'lyric'],
+    // 关联歌词时一并存下歌名与歌手，网易云没有歌词时能据此去别的平台找
+    primaryKey: ['title', 'artist'],
     hints: {
         importMusicSheet: [
             '支持网易云歌单链接、歌曲链接或纯 ID',
@@ -381,60 +680,38 @@ module.exports = {
         },
     ],
 
-    async getTopLists() {
-        const data = await request('/api/toplist');
-        const list = data?.list || [];
-
-        const official = [];
-        const globalCharts = [];
-        const featured = [];
-
-        list.forEach((item) => {
-            const sheetItem = toSheetItem(item);
-            if (!sheetItem) {
-                return;
-            }
-            if (OFFICIAL_CHART_IDS.includes(sheetItem.id)) {
-                official.push(sheetItem);
-                return;
-            }
-            const isGlobal = GLOBAL_CHART_KEYWORDS.some((keyword) =>
-                sheetItem.title.includes(keyword),
-            );
-            if (isGlobal) {
-                globalCharts.push(sheetItem);
-            } else {
-                featured.push(sheetItem);
-            }
-        });
-
-        return [
-            { title: '官方榜单', data: official },
-            { title: '全球榜单', data: globalCharts },
-            { title: '特色榜单', data: featured },
-        ];
+    async getRecommendSheetTags() {
+        return {
+            pinned: PINNED_TAGS.map((title) => ({ id: title, title })),
+            data: TAG_GROUPS.map((group) => ({
+                title: group.title,
+                data: group.data.map((title) => ({ id: title, title })),
+            })),
+        };
     },
 
-    async getTopListDetail(topListItem, page) {
-        const id = topListItem?.id;
-        if (!id) {
-            return { topListItem: topListItem || {}, musicList: [], isEnd: true };
+    async getRecommendSheetsByTag(tag, page) {
+        const current = Math.max(1, Number(page) || 1);
+        const cat = String(tag?.id || '').trim();
+        const composite = COMPOSITE_TAGS[cat];
+        if (composite) {
+            return fetchCompositeSheets(composite, current);
         }
-        const playlist = await fetchPlaylistDetail(id);
-        const musicList = toMusicList(playlist.tracks);
-        const { musicList: currentList, isEnd } = paginate(
-            musicList,
-            page,
-            DETAIL_PAGE_SIZE,
-        );
+        const offset = (current - 1) * SHEET_PAGE_SIZE;
+        const params = {
+            order: 'hot',
+            limit: SHEET_PAGE_SIZE,
+            offset,
+        };
+        if (cat) {
+            params.cat = cat;
+        }
+        const data = await request('/api/playlist/list', params);
+        const playlists = data?.playlists || [];
+        const total = Number(data?.total) || 0;
         return {
-            topListItem: {
-                ...topListItem,
-                ...(toSheetItem(playlist) || {}),
-                trackCount: musicList.length,
-            },
-            musicList: currentList,
-            isEnd,
+            data: playlists.map(toSheetItem).filter(Boolean),
+            isEnd: playlists.length === 0 || offset + playlists.length >= total,
         };
     },
 
@@ -443,21 +720,18 @@ module.exports = {
         if (!id) {
             return { sheetItem: sheetItem || {}, musicList: [], isEnd: true };
         }
+        const current = Math.max(1, Number(page) || 1);
         const playlist = await fetchPlaylistDetail(id);
-        const musicList = toMusicList(playlist.tracks);
-        const { musicList: currentList, isEnd } = paginate(
-            musicList,
-            page,
-            DETAIL_PAGE_SIZE,
-        );
+        const tracks = playlist.tracks || [];
+        const start = (current - 1) * TRACK_PAGE_SIZE;
         return {
             sheetItem: {
                 ...sheetItem,
                 ...(toSheetItem(playlist) || {}),
-                trackCount: musicList.length,
+                trackCount: tracks.length,
             },
-            musicList: currentList,
-            isEnd,
+            musicList: toMusicList(tracks.slice(start, start + TRACK_PAGE_SIZE)),
+            isEnd: start + TRACK_PAGE_SIZE >= tracks.length,
         };
     },
 
@@ -468,16 +742,13 @@ module.exports = {
         }
         const data = await request('/api/album/' + encodeURIComponent(String(id)));
         const album = data?.album || {};
-        const musicList = toMusicList(album.songs);
-        const { musicList: currentList, isEnd } = paginate(
-            musicList,
-            page,
-            DETAIL_PAGE_SIZE,
-        );
+        const tracks = album.songs || [];
+        const current = Math.max(1, Number(page) || 1);
+        const start = (current - 1) * TRACK_PAGE_SIZE;
         return {
             albumItem: { ...albumItem, ...(toAlbumItem(album) || {}) },
-            musicList: currentList,
-            isEnd,
+            musicList: toMusicList(tracks.slice(start, start + TRACK_PAGE_SIZE)),
+            isEnd: start + TRACK_PAGE_SIZE >= tracks.length,
         };
     },
 
@@ -494,8 +765,8 @@ module.exports = {
         return musicItem;
     },
 
-    async importMusicSheet(input) {
-        const resource = extractResourceId(input);
+    async importMusicSheet(urlLike) {
+        const resource = extractResourceId(urlLike);
         if (!resource) {
             throw new Error('无法识别的歌单链接或 ID');
         }
@@ -561,10 +832,19 @@ module.exports = {
         });
         const rawLrc = data?.lrc?.lyric || '';
         const translation = data?.tlyric?.lyric || '';
-        if (!rawLrc && !translation) {
-            return { rawLrc: NO_LYRIC_LRC, translation: '' };
+        if (isUsableLyric(rawLrc)) {
+            return { rawLrc, translation };
         }
-        return { rawLrc, translation };
+        // 网易云没有这首歌的歌词，改从 QQ 音乐与 LRCLIB 取
+        const song = await resolveSongName(musicItem);
+        const fallback = await fetchFallbackLyric(song.title, song.artist);
+        if (fallback) {
+            return fallback;
+        }
+        if (rawLrc.trim() || translation.trim()) {
+            return { rawLrc, translation };
+        }
+        return { rawLrc: NO_LYRIC_LRC, translation: '' };
     },
 
     async search(query, page, type) {
@@ -599,20 +879,20 @@ module.exports = {
             total = result.playlistCount || 0;
         }
 
-        let data2 = [];
+        let items = [];
         if (type === 'album') {
-            data2 = raw.map(toAlbumItem).filter(Boolean);
+            items = raw.map(toAlbumItem).filter(Boolean);
         } else if (type === 'artist') {
-            data2 = raw.map(toArtistItem).filter(Boolean);
+            items = raw.map(toArtistItem).filter(Boolean);
         } else if (type === 'sheet') {
-            data2 = raw.map(toSheetItem).filter(Boolean);
+            items = raw.map(toSheetItem).filter(Boolean);
         } else {
-            data2 = raw.map(toMusicItem).filter(Boolean);
+            items = raw.map(toMusicItem).filter(Boolean);
         }
 
         return {
-            data: data2,
-            isEnd: data2.length === 0 || offset + data2.length >= total,
+            data: items,
+            isEnd: items.length === 0 || offset + items.length >= total,
         };
     },
 };

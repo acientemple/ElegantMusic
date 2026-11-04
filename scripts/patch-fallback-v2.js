@@ -1,7 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 
-const dir = 'C:/Users/Lenovo/AppData/Roaming/MusicFree/musicfree-plugins';
+const dir = path.resolve(__dirname, '../plugins');
 const files = ['music-chart.js', 'hot-sheets.js', 'full-track.js'];
 
 const PATCHES = [

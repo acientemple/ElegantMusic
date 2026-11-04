@@ -6,7 +6,7 @@ global.env = { getUserVariables: () => ({}) };
 
 const PLUGIN_PATH =
     process.env.PLUGIN_PATH ||
-    'C:/Users/Lenovo/AppData/Roaming/MusicFree/musicfree-plugins/full-track.js';
+    path.resolve(__dirname, '../plugins/full-track.js');
 const localCopy = path.join(__dirname, '_plugin_under_test.js');
 fs.copyFileSync(path.resolve(PLUGIN_PATH), localCopy);
 const plugin = require(localCopy);

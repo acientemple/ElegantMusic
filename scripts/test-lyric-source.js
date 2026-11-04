@@ -1,3 +1,4 @@
+const path = require('path');
 // 在 Node 里跑插件逻辑：把 axios 换成 fetch 实现
 const Module = require('module');
 const origLoad = Module._load;
@@ -27,7 +28,7 @@ Module._load = function (request, parent, isMain) {
 
 global.env = { getUserVariables: () => ({}) };
 
-const plugin = require('C:/Users/Lenovo/AppData/Roaming/MusicFree/musicfree-plugins/lyric-source.js');
+const plugin = require(path.resolve(__dirname, '../plugins/lyric-source.js'));
 
 function brief(lrc) {
     if (!lrc) return 'null';

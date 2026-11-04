@@ -1,7 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 
-const dir = 'C:/Users/Lenovo/AppData/Roaming/MusicFree/musicfree-plugins';
+const dir = path.resolve(__dirname, '../plugins');
 const bumps = {
     'lyric-source.js': ['1.0.0', '1.1.0'],
     'music-chart.js': ['1.1.0', '1.2.0'],

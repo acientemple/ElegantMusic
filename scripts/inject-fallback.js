@@ -244,7 +244,7 @@ const NEW_GET_LYRIC = `    async getLyric(musicItem) {
 
 const ANCHOR = 'function toHttps(url) {';
 
-const dir = 'C:/Users/Lenovo/AppData/Roaming/MusicFree/musicfree-plugins';
+const dir = path.resolve(__dirname, '../plugins');
 const files = ['music-chart.js', 'hot-sheets.js', 'full-track.js'];
 
 files.forEach((name) => {

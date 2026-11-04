@@ -1,7 +1,7 @@
 const path = require('path'); const fs = require('fs');
 global.env = { getUserVariables: () => ({}) };
 const localCopy = path.join(__dirname, '_plugin_under_test.js');
-fs.copyFileSync('C:/Users/Lenovo/AppData/Roaming/MusicFree/musicfree-plugins/full-track.js', localCopy);
+fs.copyFileSync(path.resolve(__dirname, '../plugins/full-track.js'), localCopy);
 const plugin = require(localCopy);
 const cases = [
   ['【纯享版】海阔天空', 'Beyond', 320],

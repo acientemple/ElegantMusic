@@ -1,2 +1,13 @@
 node_modules/
-shot-*.png
+
+# 运行时生成的中间产物（由 scripts/ 下的脚本产生，不入库）
+scripts/_plugin_under_test.js
+scripts/_hot-sheets.js
+scripts/_music-chart.js
+scripts/*.bak.js
+scripts/shot-*.png
+
+# MusicFree 运行数据：播放队列、搜索历史、收藏歌单、界面偏好等个人数据
+userData/
+appData/
+musicfree-plugin-storage/

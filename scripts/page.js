@@ -1,6 +1,6 @@
 const path = require('path'); const fs = require('fs');
 global.env = { getUserVariables: () => ({}) };
-fs.copyFileSync('C:/Users/Lenovo/AppData/Roaming/MusicFree/musicfree-plugins/full-track.js', path.join(__dirname,'_plugin_under_test.js'));
+fs.copyFileSync(path.resolve(__dirname, '../plugins/full-track.js'), path.join(__dirname,'_plugin_under_test.js'));
 const plugin = require(path.join(__dirname,'_plugin_under_test.js'));
 (async () => {
   const seen = new Set();

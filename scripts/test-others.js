@@ -1,6 +1,6 @@
 const path = require('path'); const fs = require('fs');
 global.env = { getUserVariables: () => ({}) };
-const base = 'C:/Users/Lenovo/AppData/Roaming/MusicFree/musicfree-plugins/';
+const base = path.resolve(__dirname, '../plugins') + path.sep;
 async function load(name){const c=path.join(__dirname,'_'+name);fs.copyFileSync(base+name,c);return require(c);}
 (async()=>{
   for (const name of ['music-chart.js','hot-sheets.js']) {

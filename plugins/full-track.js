@@ -173,6 +173,247 @@ const FALLBACK_SEARCH_ENGINES = [
 // 渲染层随后读取 null.rawLrc 抛错，故用占位歌词兜底。
 const NO_LYRIC_LRC = '[00:00.00]暂无歌词';
 
+
+/* ---------------------------- 跨源歌词兜底 ---------------------------- */
+
+// 网易云没有收录这首歌、或这首歌没有歌词时，改从 QQ 音乐与 LRCLIB 取词
+const FALLBACK_TIMEOUT = 6000;
+/** LRCLIB 常年不稳定，给它更短的超时，别拖累整体取词速度 */
+const LRCLIB_TIMEOUT = 3000;
+
+// 归一化歌名 / 歌手：去掉大小写、空白与标点
+function fallbackKey(text) {
+    return String(text || '')
+        .toLowerCase()
+        .replace(/[\s·・\-_~,，。!！?？'"“”]/g, '');
+}
+
+// 去掉括号里的修饰（Live / DJ版 / 官方版…）
+function fallbackLooseKey(text) {
+    return fallbackKey(text).replace(/[（(\[【《][^）)\]】》]*[）)\]】》]/g, '');
+}
+
+/** 带时间轴的行数，带时间轴的歌词才用得上 */
+function countLyricTimedLines(lrc) {
+    return String(lrc || '')
+        .split(/\r?\n/)
+        .filter((line) => /\[\d{1,3}:\d{1,2}([.:]\d{1,3})?\]/.test(line))
+        .length;
+}
+
+/** 至少两行带时间轴、且不是「暂无歌词」才算有用的歌词 */
+function isUsableLyric(lrc) {
+    if (countLyricTimedLines(lrc) < 2) {
+        return false;
+    }
+    return !/暂无(歌词|字幕)|歌词不存在|no\s*lyrics?/i.test(lrc);
+}
+
+/** 歌名与歌手都对得上才算命中，歌名完全一致优先于带修饰的版本 */
+function songMatchScore(candidateTitle, candidateArtist, title, artist) {
+    const ct = fallbackKey(candidateTitle);
+    const nt = fallbackKey(title);
+    if (!ct || !nt) {
+        return 0;
+    }
+    let score = 0;
+    if (ct === nt) {
+        score += 4;
+    } else if (fallbackLooseKey(candidateTitle) === fallbackLooseKey(title)) {
+        score += 3;
+    } else if (fallbackLooseKey(candidateTitle).includes(fallbackLooseKey(title))) {
+        score += 1;
+    }
+    const ca = fallbackKey(candidateArtist);
+    const na = fallbackKey(artist);
+    if (na && ca) {
+        if (ca === na) {
+            score += 3;
+        } else if (ca.includes(na) || na.includes(ca)) {
+            score += 2;
+        }
+    }
+    return score;
+}
+
+async function fallbackGet(url, params, headers, timeout) {
+    const response = await axios.get(url, {
+        params: params || {},
+        headers: { 'user-agent': USER_AGENT, ...(headers || {}) },
+        timeout: timeout || FALLBACK_TIMEOUT,
+    });
+    return response.data;
+}
+
+/** 在 QQ 音乐里按歌名找原唱并取回歌词 */
+async function fetchQQLyricByName(title, artist) {
+    const query = [title, artist].filter(Boolean).join(' ').trim();
+    if (!query) {
+        return [];
+    }
+    const data = await fallbackGet(
+        'https://c.y.qq.com/soso/fcgi-bin/client_search_cp',
+        { p: 1, n: 10, w: query, format: 'json' },
+        { referer: 'https://y.qq.com/' },
+    );
+    const list = (data && data.data && data.data.song && data.data.song.list) || [];
+    const ranked = list
+        .map((song) => {
+            const singer = (song.singer || [])
+                .map((item) => item && item.name)
+                .filter(Boolean)
+                .join(' / ');
+            return {
+                songmid: song.songmid,
+                score: songMatchScore(song.songname || '', singer, title, artist),
+            };
+        })
+        .filter((item) => item.songmid)
+        .sort((a, b) => b.score - a.score);
+    const results = [];
+    for (const item of ranked.slice(0, 2)) {
+        // 歌名与歌手都对不上的候选直接跳过
+        if (item.score < 4) {
+            break;
+        }
+        try {
+            const lyric = await fallbackGet(
+                'https://c.y.qq.com/lyric/fcgi-bin/fcg_query_lyric_new.fcg',
+                { songmid: item.songmid, format: 'json', nobase64: 1, g_tk: 5381 },
+                { referer: 'https://y.qq.com/' },
+            );
+            if (Number(lyric && lyric.code) === 0 && lyric && lyric.lyric) {
+                results.push({
+                    rawLrc: lyric.lyric,
+                    translation: lyric.trans || '',
+                    match: item.score,
+                });
+            }
+        } catch (e) {
+            // 这条取不到就试下一条
+        }
+    }
+    return results;
+}
+
+/** LRCLIB 只能按「歌名 + 歌手」取词 */
+async function fetchLrclibLyricByName(title, artist) {
+    if (!title) {
+        return [];
+    }
+    try {
+        const data = await fallbackGet(
+            'https://lrclib.net/api/get',
+            { track_name: title, artist_name: artist || '' },
+            { referer: 'https://lrclib.net/' },
+            LRCLIB_TIMEOUT,
+        );
+        const rawLrc = (data && (data.syncedLyrics || data.plainLyrics)) || '';
+        if (rawLrc) {
+            // 按歌名与歌手精确取回的，匹配度按满计算
+            return [{ rawLrc, translation: '', match: 7 }];
+        }
+    } catch (e) {
+        // 取不到就当没有
+    }
+    return [];
+}
+
+/** 歌词里出现大量非常用字符，说明这份歌词的编码不对 */
+function garbledRatio(lrc) {
+    const chars = String(lrc || '').replace(/\s/g, '');
+    if (!chars) {
+        return 0;
+    }
+    let bad = 0;
+    for (const ch of chars) {
+        const code = ch.codePointAt(0);
+        const normal =
+            code < 128 ||
+            (code >= 0x4e00 && code <= 0x9fff) ||
+            (code >= 0x3000 && code <= 0x303f) ||
+            (code >= 0xff00 && code <= 0xffef) ||
+            (code >= 0x2010 && code <= 0x206f);
+        if (!normal) {
+            bad += 1;
+        }
+    }
+    return bad / chars.length;
+}
+
+/** 去掉 [ti:] [ar:] 这类头部信息，坏编码时它们会显示成乱码 */
+function cleanLyricHeader(lrc) {
+    return String(lrc || '')
+        .split(/\r?\n/)
+        .filter((line) => !/^\s*\[(ti|ar|al|by)\s*:/i.test(line))
+        .join('\n');
+}
+
+/**
+ * 挑一份最好的歌词：
+ * 先看是不是同一首歌（匹配度），再看歌词本身是否完整。
+ * 只按行数挑会选到 DJ 版、变速版这类行数更多却不是原版的歌词
+ */
+function pickBestLyric(list) {
+    let best = null;
+    let bestScore = -1;
+    (list || []).forEach((item) => {
+        if (!item || !isUsableLyric(item.rawLrc)) {
+            return;
+        }
+        let score = (item.match || 0) * 100;
+        score += Math.min(countLyricTimedLines(item.rawLrc), 60);
+        if (item.translation && item.translation.trim()) {
+            score += 25;
+        }
+        score -= Math.round(garbledRatio(item.rawLrc) * 100);
+        if (score > bestScore) {
+            bestScore = score;
+            best = {
+                rawLrc: cleanLyricHeader(item.rawLrc),
+                translation: item.translation || '',
+            };
+        }
+    });
+    return best;
+}
+
+/** 网易云没有歌词时的跨源兜底：先用 QQ，QQ 没有再用 LRCLIB */
+async function fetchFallbackLyric(title, artist) {
+    if (!title) {
+        return null;
+    }
+    const qqResults = await fetchQQLyricByName(title, artist).catch(() => []);
+    const fromQQ = pickBestLyric(qqResults);
+    if (fromQQ) {
+        return fromQQ;
+    }
+    const lrclibResults = await fetchLrclibLyricByName(title, artist).catch(() => []);
+    return pickBestLyric(lrclibResults);
+}
+
+/** 关联歌词后拿不到歌名时，用网易云的详情接口反查 */
+async function resolveSongName(musicItem) {
+    let title = String((musicItem && musicItem.title) || '').trim();
+    let artist = String((musicItem && musicItem.artist) || '').trim();
+    if ((title && artist) || !(musicItem && musicItem.id)) {
+        return { title, artist };
+    }
+    try {
+        const data = await request('/api/song/detail', {
+            ids: '[' + musicItem.id + ']',
+        });
+        const song = (data && data.songs && data.songs[0]) || null;
+        if (song) {
+            title = title || song.name || '';
+            artist = artist || pickArtistName(song);
+        }
+    } catch (e) {
+        // 反查不到就用现有信息
+    }
+    return { title, artist };
+}
+
 function toHttps(url) {
     return typeof url === 'string' ? url.replace(/^http:\/\//, 'https://') : url;
 }
@@ -558,12 +799,14 @@ function buildQueries(title, artist) {
 
 module.exports = {
     platform: PLATFORM,
-    version: '1.2.0',
+    version: '1.4.0',
     author: 'MusicFree',
     description:
         '网易云音乐完整版搜索：多引擎互备检索，只返回能整轨播放的歌曲，并可按歌名找出同一首歌的其他完整版本',
     cacheControl: 'no-cache',
     supportedSearchType: ['music'],
+    // 关联歌词时一并存下歌名与歌手，网易云没有歌词时能据此去别的平台找
+    primaryKey: ['title', 'artist'],
     userVariables: [
         {
             key: 'cookie',
@@ -711,9 +954,18 @@ module.exports = {
         });
         const rawLrc = data?.lrc?.lyric || '';
         const translation = data?.tlyric?.lyric || '';
-        if (!rawLrc && !translation) {
-            return { rawLrc: NO_LYRIC_LRC, translation: '' };
+        if (isUsableLyric(rawLrc)) {
+            return { rawLrc, translation };
         }
-        return { rawLrc, translation };
+        // 网易云没有这首歌的歌词，改从 QQ 音乐与 LRCLIB 取
+        const song = await resolveSongName(musicItem);
+        const fallback = await fetchFallbackLyric(song.title, song.artist);
+        if (fallback) {
+            return fallback;
+        }
+        if (rawLrc.trim() || translation.trim()) {
+            return { rawLrc, translation };
+        }
+        return { rawLrc: NO_LYRIC_LRC, translation: '' };
     },
 };
