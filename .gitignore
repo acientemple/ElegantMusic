@@ -6,6 +6,7 @@ scripts/_hot-sheets.js
 scripts/_music-chart.js
 scripts/*.bak.js
 scripts/shot-*.png
+scripts/_*.json
 
 # MusicFree 运行数据：播放队列、搜索历史、收藏歌单、界面偏好等个人数据
 userData/
