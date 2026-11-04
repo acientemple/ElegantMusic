@@ -3,7 +3,10 @@ const fs = require('fs');
 
 async function evalInApp(expression) {
     const list = await (await fetch('http://localhost:9222/json')).json();
-    const page = list.find((t) => t.type === 'page');
+    // 排除 DevTools 自身页面（它也是 type=page，且常排在最前）
+    const page = list.find(
+        (t) => t.type === 'page' && !t.url.startsWith('devtools://')
+    );
     const ws = new WebSocket(page.webSocketDebuggerUrl);
     let id = 0;
     const pending = new Map();
