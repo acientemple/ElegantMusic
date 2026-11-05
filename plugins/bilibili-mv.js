@@ -100,6 +100,14 @@ const AUDIO_QUALITY_LEVELS = {
     super: [30280, 30232, 30216],
 };
 
+/** durl 的画质 id：16=360P 32=480P 64=720P 80=1080P（durl 没有 4K） */
+const DOWNLOAD_QUALITY_LEVELS = {
+    low: 32,
+    standard: 64,
+    high: 80,
+    super: 80,
+};
+
 /** 编码兼容性：avc1 最稳，其次 hev1，最后 av01 */
 const CODEC_RANK = (codecs) => {
     if (/avc1/i.test(codecs || '')) return 0;
@@ -357,6 +365,15 @@ function extractBvid(input) {
     }
     const matched = text.match(/(BV[0-9A-Za-z]{10})/);
     return matched ? matched[1] : null;
+}
+
+/** 文件名里不能有的字符 */
+function sanitizeFileName(name) {
+    return String(name || '')
+        .replace(/[/\\?*"<>:|]/g, '_')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .slice(0, 80);
 }
 
 /** 判断是不是单曲 MV：合集、伴奏这类一律不要 */
@@ -730,6 +747,42 @@ module.exports = {
             headers: streamHeaders(),
             width: stream.width,
             height: stream.height,
+        };
+    },
+
+    /**
+     * 下载地址。
+     * DASH 把音视频拆成两个文件，单独存下来只有画面没有声音；
+     * durl（fnval=1）返回的是音视频合一的 mp4，才能存成能看的视频。
+     */
+    async getVideoDownloadSource(musicItem, quality) {
+        const bvid = extractBvid(musicItem?.id || musicItem?.bvid);
+        if (!bvid) {
+            throw new Error('缺少视频 BV 号');
+        }
+        const info = await fetchVideoInfo(bvid);
+        const aid = info?.aid;
+        const cid = info?.cid;
+        if (!aid || !cid) {
+            throw new Error('未找到视频分P信息');
+        }
+        const qn = DOWNLOAD_QUALITY_LEVELS[quality] ?? 64;
+        const data = await requestJson(
+            `https://api.bilibili.com/x/player/playurl?avid=${aid}&cid=${cid}&qn=${qn}&fnval=1&fourk=1&platform=html5&high_quality=1`,
+            {headers: baseHeaders({referer: `https://www.bilibili.com/video/${bvid}/`})},
+        );
+        if (data?.code !== 0) {
+            throw new Error(data?.message || '无法获取下载地址');
+        }
+        const durl = data?.data?.durl?.[0];
+        if (!durl?.url) {
+            throw new Error('该视频没有可下载的文件');
+        }
+        return {
+            url: toHttps(durl.url),
+            headers: streamHeaders(),
+            filename: `${sanitizeFileName(info?.title || musicItem?.title || bvid)}.mp4`,
+            size: durl.size,
         };
     },
 
