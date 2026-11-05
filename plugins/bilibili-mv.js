@@ -32,6 +32,56 @@ const MAX_DURATION = 15 * 60;
 const EXCLUDE_WORDS = [
     '合集', '全集', '合辑', '大盘点', '盘点', '歌单', '连播', '集锦', '混剪',
     '伴奏', '纯音乐', '钢琴版', '吉他版', '钢琴谱', '歌词排版', '直播回放', '录屏',
+    '鼓谱', '琴谱', '谱子', '音高', '鬼畜', '吉他', '古筝', '二胡', 'KTV',
+];
+
+/** 蹭热度的营销词，只查标题；B 站的 tag 里有「经典」「怀旧」这类无害标签，查 tag 会误杀 */
+const TITLE_EXCLUDE_WORDS = [
+    '网络神曲', '神曲', '经典回顾', '回顾', '撕心裂肺', '听哭', '唱哭', '心碎',
+    '车载', '劲爆', '嗨起来', 'DJ舞曲', '助眠', '睡前', '热歌', '必听', '大全',
+    '伤感歌曲', '经典老歌',
+];
+
+/** 搬运号的 UP 主特征，这类号发的基本是拼凑视频 */
+const EXCLUDE_AUTHORS = ['情感音乐', '影视音乐', '热门音乐', '音像'];
+
+/** 分区跟 MV 无关的扣分，扣得狠的基本是蹭热度 */
+const AREA_PENALTY = {
+    综艺: -30,
+    明星综合: -30,
+    日常: -10,
+    手机游戏: -40,
+    知识: -30,
+    影视: -30,
+    游戏: -40,
+    动画: -30,
+    演奏: -40,
+    乐评盘点: -40,
+    音乐现场: -15,
+    电台: -25,
+    热点: -30,
+    电子竞技: -40,
+    音乐教学: -30,
+    翻唱: -25,
+    VOCALOID: -40,
+    音MAD: -30,
+    绘画: -30,
+    手书: -30,
+    资讯: -30,
+    音乐综合: -12,
+};
+
+/** 现场版、歌词版之类，比官方 MV 低一等 */
+const DEMOTE_RULES = [
+    {re: /\bLive\b/i, score: -35},
+    {re: /现场|演唱会/, score: -20},
+    {re: /翻唱|降调/, score: -20},
+    {re: /戏腔版|戏曲版|Remix/i, score: -20},
+    {re: /DJ\s*版/i, score: -25},
+    {re: /手语|清唱|吟唱/, score: -20},
+    {re: /音高|人声版/, score: -20},
+    {re: /动态歌词|歌词版|歌词排版/, score: -12},
+    {re: /录音棚|Hi-?Fi|环绕|耳机福利/, score: -8},
 ];
 
 /** 画质 id：16=360P 32=480P 64=720P 80=1080P 116=1080P60 120=4K */
@@ -86,6 +136,11 @@ function getLoginCookie() {
 function stripHtml(text) {
     return String(text || '')
         .replace(/<[^>]+>/g, '')
+        // B 站搜索结果会把撇号之类编码成 &#x27;，不解码的话歌名永远匹配不上
+        .replace(/&#x([0-9a-f]+);/gi, (_, hex) =>
+            String.fromCodePoint(Number.parseInt(hex, 16)),
+        )
+        .replace(/&#(\d+);/g, (_, dec) => String.fromCodePoint(Number(dec)))
         .replace(/&quot;/g, '"')
         .replace(/&apos;/g, "'")
         .replace(/&amp;/g, '&')
@@ -312,6 +367,13 @@ function isSingleMv(video) {
     if (EXCLUDE_WORDS.some((word) => haystack.includes(word))) {
         return false;
     }
+    if (TITLE_EXCLUDE_WORDS.some((word) => title.includes(word))) {
+        return false;
+    }
+    const author = String(video.author || '');
+    if (EXCLUDE_AUTHORS.some((word) => author.includes(word))) {
+        return false;
+    }
     if (video.is_pay || video.is_charge_video) {
         return false;
     }
@@ -322,19 +384,62 @@ function isSingleMv(video) {
     return true;
 }
 
+/** 去掉空格标点，只留文字和数字，方便比较歌名 */
+function normalizeText(text) {
+    return String(text || '')
+        .toLowerCase()
+        .replace(/[^\p{L}\p{N}]/gu, '');
+}
+
+/** 歌名是不是中日韩文字，这类歌名组合相对独特 */
+function isCjkSong(song) {
+    return /[㐀-䶿一-鿿豈-﫿぀-ヿ가-힯]/.test(song);
+}
+
+/** 歌名够不够独特，够独特才允许在没有歌手线索时放宽匹配 */
+function isDistinctSong(song) {
+    return song.length >= 6 || isCjkSong(song);
+}
+
+/** 标题里有没有出现歌名 */
+function titleHasSong(video, song) {
+    return normalizeText(stripHtml(video?.title)).includes(song);
+}
+
+/** 标题里有没有出现歌手名；只看标题，标签里带艺人名不代表视频就是这歌的 */
+function titleHasArtist(video, artist) {
+    return normalizeText(stripHtml(video?.title)).includes(artist);
+}
+
+/** 有没有明确的 MV 信号：分区是 MV，或者标题/标签里写着 MV */
+function hasMvSignal(video) {
+    if (String(video?.typename || '') === 'MV') {
+        return true;
+    }
+    const haystack = `${stripHtml(video?.title)} ${String(video?.tag || '')}`;
+    return /MV|M\/V/i.test(haystack);
+}
+
 /** MV 相关度打分，用来把真正的 MV 排到前面 */
 function scoreMv(video) {
     const title = stripHtml(video.title);
     const tags = String(video.tag || '');
+    const area = String(video.typename || '');
     const haystack = `${title} ${tags}`;
     let score = 0;
-    if (video.typename === 'MV') {
+    if (area === 'MV') {
         score += 50;
     }
-    if (/(^|,)\s*MV\s*(,|$)/i.test(tags)) {
-        score += 30;
+    for (const [name, penalty] of Object.entries(AREA_PENALTY)) {
+        if (area.includes(name)) {
+            score += penalty;
+            break;
+        }
     }
-    if (/官方\s*MV/i.test(haystack)) {
+    if (/(^|,)\s*MV\s*(,|$)/i.test(tags)) {
+        score += 20;
+    }
+    if (/官方/.test(haystack)) {
         score += 25;
     }
     if (/原版\s*MV/i.test(haystack)) {
@@ -346,17 +451,47 @@ function scoreMv(video) {
     if (/(^|,)单曲(,|$)/.test(tags)) {
         score += 15;
     }
+    if (/\bMV\b/i.test(title)) {
+        score += 15;
+    }
+    if (/完整版|正版/.test(title)) {
+        score += 12;
+    }
     if (/歌词视频/.test(haystack)) {
         score += 8;
     }
     if (/Hi-?Res|无损|4K|1080P|超清/i.test(title)) {
         score += 5;
     }
+    for (const rule of DEMOTE_RULES) {
+        if (rule.re.test(haystack)) {
+            score += rule.score;
+        }
+    }
     const play = Number(video.play);
     if (Number.isFinite(play) && play > 0) {
-        score += Math.min(20, Math.log10(play) * 4);
+        score += Math.min(12, Math.log10(play) * 3);
     }
     return score;
+}
+
+/** 画面长度要跟歌曲差不多，太短是片段，太长多半是合集 */
+function isFullLength(video, songDuration) {
+    const song = Number(songDuration);
+    if (!Number.isFinite(song) || song <= 0) {
+        return true;
+    }
+    const duration = parseDuration(video.duration);
+    if (!duration) {
+        return true;
+    }
+    if (duration < song * 0.6) {
+        return false;
+    }
+    if (duration > song * 3) {
+        return false;
+    }
+    return true;
 }
 
 function toMusicItem(video) {
@@ -468,7 +603,7 @@ const NO_LYRIC_LRC = '[00:00.00]暂无字幕';
 
 module.exports = {
     platform: PLATFORM,
-    version: '1.0.0',
+    version: '1.1.0',
     author: 'MusicFree',
     module: '搜索',
     defaultSearchType: 'music',
@@ -650,6 +785,68 @@ module.exports = {
             artist: videoData.owner?.name || '',
             artwork: toHttps(videoData.pic),
             duration: parseDuration(videoData.duration),
+        };
+    },
+
+    /**
+     * 按歌曲找 MV 候选。
+     * 官方 MV 常常不带 "MV" 字样，所以同时搜「歌名 歌手」和「歌名 歌手 MV」；
+     * 候选的 id 是 BV 号，被选中后可以直接交给 getVideoSource 取流。
+     */
+    async getMusicVideoCandidates(musicItem, page) {
+        const title = String(musicItem?.title ?? '').trim();
+        const artist = String(musicItem?.artist ?? '').trim();
+        if (!title) {
+            return {isEnd: true, data: []};
+        }
+        const current = Math.max(1, Number(page) || 1);
+        const songDuration = Number(musicItem?.duration);
+        // 官方 MV 常常只写歌名，所以歌名单独再搜一遍
+        const keywords = [
+            `${title} ${artist}`.trim(),
+            `${title} ${artist} MV`.trim(),
+            title,
+        ];
+        const seen = new Set();
+        const merged = [];
+        const resultLists = await Promise.all(
+            keywords.map((keyword) =>
+                searchVideos(keyword, current).catch(() => []),
+            ),
+        );
+        for (const results of resultLists) {
+            for (const video of results) {
+                if (!video?.bvid || seen.has(video.bvid)) {
+                    continue;
+                }
+                seen.add(video.bvid);
+                if (isSingleMv(video) && isFullLength(video, songDuration)) {
+                    merged.push(video);
+                }
+            }
+        }
+        // 标题里没有歌名的多半是蹭热度，宁可没有也不要给一堆不相干的
+        const song = normalizeText(title);
+        const artistKey = normalizeText(artist);
+        const named = merged.filter((video) => titleHasSong(video, song));
+        // 歌手名也在标题里才算对；否则「Hello」这种常见歌名会召回一堆儿歌、翻唱
+        let matched = artistKey.length >= 2
+            ? named.filter((video) => titleHasArtist(video, artistKey))
+            : [];
+        if (!matched.length && isDistinctSong(song)) {
+            // 没有歌手线索时放宽，但只给明确带 MV 信号的视频
+            matched = named.filter((video) => hasMvSignal(video));
+        }
+        const scored = matched
+            .map((video) => ({video, score: scoreMv(video)}))
+            .sort((a, b) => b.score - a.score);
+        // 分数为负的基本都是凑数的，有好货的时候不必展示
+        const good = scored.filter((item) => item.score > 0);
+        const picked = (good.length ? good : scored).slice(0, 15);
+        const data = picked.map((item) => toMusicItem(item.video)).filter(Boolean);
+        return {
+            isEnd: data.length === 0,
+            data,
         };
     },
 
