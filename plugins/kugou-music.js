@@ -515,14 +515,234 @@ async function fetchQQPlayUrl(title, artist, durationSec, quality) {
 }
 
 
+/* ---------------------------- 完整版候选 ---------------------------- */
+
+/** 每轮检索取多少条 */
+const ALTERNATIVE_QUERY_LIMIT = 30;
+/** 最终返回的候选上限 */
+const ALTERNATIVE_LIMIT = 20;
+/** 最多实测多少个候选的可播长度 */
+const ALTERNATIVE_PROBE_LIMIT = 10;
+/** 实测时的并发数 */
+const ALTERNATIVE_PROBE_CONCURRENCY = 5;
+/** 可播时长与歌曲时长之比达到这个值才算整轨 */
+const FULL_TRACK_RATIO = 0.9;
+
+/** 并发受限的 map，避免一次打出几十个请求 */
+async function mapWithLimit(items, limit, worker) {
+    const results = new Array(items.length);
+    let cursor = 0;
+    const runners = [];
+    const count = Math.min(limit, items.length);
+    for (let i = 0; i < count; i++) {
+        runners.push(
+            (async () => {
+                for (;;) {
+                    const index = cursor++;
+                    if (index >= items.length) {
+                        return;
+                    }
+                    results[index] = await worker(items[index], index);
+                }
+            })(),
+        );
+    }
+    await Promise.all(runners);
+    return results;
+}
+
+/** 歌名匹配度：3=一致，1=候选以原歌名开头，0=无关 */
+function titleMatchLevel(originTitle, candidateTitle) {
+    const origin = lyricLooseKey(originTitle);
+    const candidate = lyricLooseKey(candidateTitle);
+    if (!origin || !candidate) {
+        return 0;
+    }
+    if (origin === candidate) {
+        return 3;
+    }
+    // 只认「候选以原歌名开头」这一种扩展，双向包含会把「十年」当成「时光倒流二十年」
+    if (origin.length >= 2 && candidate.length >= 2 && candidate.startsWith(origin)) {
+        return 1;
+    }
+    return 0;
+}
+
+/** 拆歌手名，酷狗的多歌手条目用逗号分隔 */
+function splitArtistNames(text) {
+    return String(text || '')
+        .split(/[,，、\/&·;]/)
+        .map((item) => lyricKey(item))
+        .filter(Boolean);
+}
+
+/** 候选与原曲歌手的关系：2=完全同名，1=一方包含另一方，0=无关 */
+function artistMatchLevel(song, origin) {
+    const originArtists = splitArtistNames(origin?.artist);
+    if (!originArtists.length) {
+        return 0;
+    }
+    const candidates = (
+        Array.isArray(song?.Singers) && song.Singers.length
+            ? song.Singers.map((item) => lyricKey(item?.name))
+            : splitArtistNames(song?.SingerName)
+    ).filter(Boolean);
+    if (!candidates.length) {
+        return 0;
+    }
+    let best = 0;
+    for (const candidate of candidates) {
+        for (const originArtist of originArtists) {
+            if (candidate === originArtist) {
+                best = Math.max(best, 2);
+            } else if (
+                candidate.length >= 2 &&
+                originArtist.length >= 2 &&
+                (candidate.includes(originArtist) || originArtist.includes(candidate))
+            ) {
+                best = Math.max(best, 1);
+            }
+        }
+    }
+    return best;
+}
+
+/** 候选排序分：同名同唱优先，时长接近原曲的靠前 */
+function scoreCandidate(song, origin) {
+    let score = 0;
+    const titleLevel = titleMatchLevel(origin?.title, song?.SongName);
+    if (titleLevel === 3) {
+        score += 100;
+    } else if (titleLevel === 1) {
+        score += 40;
+    }
+    const artistLevel = artistMatchLevel(song, origin);
+    if (artistLevel === 2) {
+        score += 60;
+    } else if (artistLevel === 1) {
+        score += 25;
+    }
+    const originDuration = Number(origin?.duration || 0);
+    const duration = Number(song?.Duration || 0);
+    if (originDuration > 0 && duration > 0) {
+        score -= Math.abs(duration - originDuration) / 60;
+    }
+    return score;
+}
+
+/** 只按歌名搜会漏掉原唱，组合多种查询词 */
+function buildAlternativeQueries(title, artist) {
+    const queries = [];
+    const clean = String(title || '')
+        .replace(/[（(\[【][^）)\]】]*[）)\]】]/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+    if (clean && clean !== title) {
+        queries.push(clean);
+    }
+    queries.push(title);
+    if (artist) {
+        queries.push(`${title} ${artist}`);
+    }
+    return queries.filter((query, index) => query && queries.indexOf(query) === index);
+}
+
+/** 检索歌曲，返回酷狗搜索接口的原始条目 */
+async function searchSongs(keyword, limit) {
+    const data = await getJson(SEARCH_API, {
+        keyword,
+        page: 1,
+        pagesize: limit,
+        platform: 'WebFilter',
+        userid: 0,
+        clientver: 2000,
+        iscorrection: 1,
+        privilege_filter: 0,
+        area_code: 1,
+        filter: 10,
+    }).catch(() => null);
+    const list = data?.data?.lists;
+    return Array.isArray(list) ? list : [];
+}
+
+/**
+ * 实测这首歌在酷狗上能播多长（秒）。
+ * 付费曲的 playInfo 会返回 status=0，fileSize 取不到，这里直接判定为不可用。
+ */
+async function measurePlayableLength(song) {
+    const hash = String(song?.FileHash || '');
+    if (!hash) {
+        return 0;
+    }
+    const info = await fetchPlayUrl(hash);
+    if (!info || !info.fileSize || !info.bitRate) {
+        return 0;
+    }
+    return (info.fileSize * 8) / (info.bitRate * 1000);
+}
+
+/** 挑出真正能整轨播放的候选 */
+async function pickFullTracks(candidates, origin) {
+    const originDuration = Number(origin?.duration || 0);
+    const originId = origin?.platform === PLATFORM ? String(origin?.id || '') : '';
+    const ranked = candidates
+        .filter((song) => song?.FileHash && String(song.FileHash) !== originId)
+        .map((song) => ({ song, score: scoreCandidate(song, origin) }))
+        .sort((a, b) => b.score - a.score)
+        .slice(0, ALTERNATIVE_PROBE_LIMIT);
+    if (!ranked.length) {
+        return [];
+    }
+    const measured = await mapWithLimit(
+        ranked,
+        ALTERNATIVE_PROBE_CONCURRENCY,
+        (entry) => measurePlayableLength(entry.song),
+    );
+    const full = [];
+    ranked.forEach((entry, index) => {
+        const song = entry.song;
+        const playable = Number(measured[index]) || 0;
+        // 测不出长度说明这首在酷狗拿不到音源（付费曲最常见），直接排除
+        if (playable <= 0) {
+            return;
+        }
+        const selfDuration = Number(song.Duration || 0);
+        // 音源长度要能对上这首歌自己的元数据，否则只是同名片段
+        if (selfDuration > 0 && playable / selfDuration < FULL_TRACK_RATIO) {
+            return;
+        }
+        // 还要跟原曲差不多长，避免把别的版本塞给用户
+        const reference = originDuration > 0 ? originDuration : selfDuration;
+        if (reference > 0 && playable / reference < FULL_TRACK_RATIO) {
+            return;
+        }
+        full.push(entry);
+    });
+    full.sort((a, b) => b.score - a.score);
+    return full
+        .map((entry) => {
+            const item = toMusicItemFromSearch(entry.song);
+            if (!item) {
+                return null;
+            }
+            item.isOriginArtist = artistMatchLevel(entry.song, origin) === 2;
+            item.durationDelta = originDuration
+                ? Math.round(Math.abs(Number(entry.song.Duration || 0) - originDuration))
+                : null;
+            return item;
+        })
+        .filter(Boolean);
+}
+
+
 /* ---------------------------- 插件 ---------------------------- */
 
 module.exports = {
-    version: '1.0.0',
+    version: '1.1.0',
     module: '榜单',
     platform: PLATFORM,
     author: '',
-    description: '酷狗音乐榜单与搜索',
+    description: '酷狗音乐榜单、搜索与完整版搜索',
     website: 'https://www.kugou.com/',
     defaultSearchType: 'music',
     supportedSearchType: ['music', 'album', 'artist', 'lyric'],
@@ -651,6 +871,67 @@ module.exports = {
             return fromQQ;
         }
         return { rawLrc: NO_LYRIC_LRC, translation: '' };
+    },
+
+    /** 查找同一首歌的其他可完整播放版本 */
+    async getMusicAlternatives(musicItem) {
+        const title = String(musicItem?.title || '').trim();
+        const artist = String(musicItem?.artist || '').trim();
+        if (!title) {
+            throw new Error('缺少歌曲名');
+        }
+
+        const collected = new Map();
+        let alive = false;
+        const collect = (list) => {
+            for (const song of list) {
+                const hash = String(song?.FileHash || '');
+                if (!hash) {
+                    continue;
+                }
+                collected.set(hash, { ...(collected.get(hash) || {}), ...song });
+            }
+        };
+
+        for (const query of buildAlternativeQueries(title, artist)) {
+            const list = await searchSongs(query, ALTERNATIVE_QUERY_LIMIT);
+            if (list.length) {
+                alive = true;
+            }
+            collect(list);
+        }
+
+        // 前几轮没搜到同名同歌手时，再单独用歌手名搜一轮
+        const hasOrigin = Array.from(collected.values()).some(
+            (song) =>
+                titleMatchLevel(title, song.SongName) === 3 &&
+                artistMatchLevel(song, musicItem) === 2,
+        );
+        if (!hasOrigin && artist) {
+            const list = await searchSongs(artist, ALTERNATIVE_QUERY_LIMIT);
+            if (list.length) {
+                alive = true;
+            }
+            collect(list);
+        }
+
+        if (!alive) {
+            throw new Error('搜索接口暂时不可用');
+        }
+
+        const all = Array.from(collected.values());
+        let candidates = all.filter(
+            (song) => titleMatchLevel(title, song.SongName) > 0,
+        );
+        if (!candidates.length) {
+            candidates = all;
+        }
+
+        const data = await pickFullTracks(candidates, musicItem);
+        return {
+            isEnd: true,
+            data: data.slice(0, ALTERNATIVE_LIMIT),
+        };
     },
 
     /** 搜索 */

@@ -28,6 +28,17 @@ const VIDEO_CACHE_MAX = 30;
 /** 单曲 MV 的时长上限，超过多半是合集或长视频 */
 const MAX_DURATION = 15 * 60;
 
+/** 一次 MV 候选检索用的关键词上限，太多会拖慢弹窗 */
+const CANDIDATE_KEYWORD_LIMIT = 12;
+/** 排在前面的关键词多翻一页，命中率高的多看几页 */
+const CANDIDATE_DEEP_KEYWORDS = 4;
+/** 并发请求上限，避免把 B 站打出风控 */
+const CANDIDATE_CONCURRENCY = 6;
+/** 一次最多给多少条候选 */
+const CANDIDATE_LIMIT = 20;
+/** 音乐分区 tid：B 站的 MV 都挂在音乐区，限定分区能滤掉综艺、游戏这类蹭热度结果 */
+const MUSIC_TID = 3;
+
 /** 标题/标签里出现这些词的多半不是单曲 MV */
 const EXCLUDE_WORDS = [
     '合集', '全集', '合辑', '大盘点', '盘点', '歌单', '连播', '集锦', '混剪',
@@ -413,6 +424,15 @@ function isCjkSong(song) {
     return /[㐀-䶿一-鿿豈-﫿぀-ヿ가-힯]/.test(song);
 }
 
+/**
+ * 歌名比对用的键，要去掉修饰。
+ * 「光年之外 (Live)」的 MV 标题往往只写「光年之外」，
+ * 不去掉修饰的话谁也匹配不上。
+ */
+function songKey(title) {
+    return normalizeText(stripDecorations(title)) || normalizeText(title);
+}
+
 /** 歌名够不够独特，够独特才允许在没有歌手线索时放宽匹配 */
 function isDistinctSong(song) {
     return song.length >= 6 || isCjkSong(song);
@@ -425,27 +445,36 @@ function titleHasSong(video, song) {
 
 /** 标题里有没有出现歌手名；只看标题，标签里带艺人名不代表视频就是这歌的 */
 function titleHasArtist(video, artist) {
+    if (!artist || artist.length < 2) {
+        return false;
+    }
     return normalizeText(stripHtml(video?.title)).includes(artist);
 }
 
-/** 有没有明确的 MV 信号：分区是 MV，或者标题/标签里写着 MV */
+/** 有没有明确的 MV 信号：分区是 MV，或者标题/标签里写着 MV、官方、完整版 */
 function hasMvSignal(video) {
     if (String(video?.typename || '') === 'MV') {
         return true;
     }
-    const haystack = `${stripHtml(video?.title)} ${String(video?.tag || '')}`;
-    return /MV|M\/V/i.test(haystack);
+    const title = stripHtml(video?.title);
+    const haystack = `${title} ${String(video?.tag || '')}`;
+    // 词边界是为了放过「AMV」「MV4」这类蹭词
+    if (/\bM\/?V\b|\bmusic\s+video\b/i.test(haystack)) {
+        return true;
+    }
+    // 官方 MV 常常只写歌名，靠「官方」「完整版」这类字样认
+    return /官方|完整版|正版/.test(title);
 }
 
 /** MV 相关度打分，用来把真正的 MV 排到前面 */
-function scoreMv(video) {
+function scoreMv(video, artistKey) {
     const title = stripHtml(video.title);
     const tags = String(video.tag || '');
     const area = String(video.typename || '');
     const haystack = `${title} ${tags}`;
     let score = 0;
     if (area === 'MV') {
-        score += 50;
+        score += 60;
     }
     for (const [name, penalty] of Object.entries(AREA_PENALTY)) {
         if (area.includes(name)) {
@@ -456,8 +485,15 @@ function scoreMv(video) {
     if (/(^|,)\s*MV\s*(,|$)/i.test(tags)) {
         score += 20;
     }
+    // 歌手名写在标题里，说明就是这首歌的 MV
+    if (titleHasArtist(video, artistKey)) {
+        score += 40;
+    }
     if (/官方/.test(haystack)) {
-        score += 25;
+        score += 30;
+    }
+    if (/官方\s*MV|正版\s*MV|音乐录影带/i.test(haystack)) {
+        score += 20;
     }
     if (/原版\s*MV/i.test(haystack)) {
         score += 20;
@@ -492,6 +528,290 @@ function scoreMv(video) {
     return score;
 }
 
+/* --------------------------- MV 候选检索 --------------------------- */
+
+/** 去掉歌名里的括号修饰，如「光年之外 (Live)」→「光年之外」 */
+function stripDecorations(text) {
+    return String(text || '')
+        .replace(/[（(【\[][^）)】\]]*[）)】\]]/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+}
+
+/** 歌手名写法很杂（「G.E.M.邓紫棋」「邓紫棋/G.E.M」），逐个变体都试一遍 */
+function artistVariants(artist) {
+    const text = String(artist || '').trim();
+    if (!text) {
+        return [];
+    }
+    const parts = text
+        .split(/[/、,&·;|]+/)
+        .map((it) => it.trim())
+        .filter(Boolean);
+    const list = [text, ...parts];
+    // 「G.E.M.邓紫棋」去掉点号也是常见写法
+    const noDot = text.replace(/[.\s·]+/g, '');
+    if (noDot) {
+        list.push(noDot);
+    }
+    return Array.from(new Set(list.filter((it) => it.length >= 2)));
+}
+
+/**
+ * 检索词矩阵。
+ * 官方 MV 的标题跟歌曲名对不上是「搜不到」的主因，
+ * 所以歌名去掉修饰、歌手名换写法、MV/官方/完整版等修饰词都要各试一遍。
+ */
+function buildCandidateKeywords(title, artist, hints) {
+    const raw = String(title || '').trim();
+    const clean = stripDecorations(raw) || raw;
+    const list = [];
+    const push = (text) => {
+        const value = String(text || '').replace(/\s+/g, ' ').trim();
+        if (value && !list.includes(value)) {
+            list.push(value);
+        }
+    };
+    const artists = artistVariants(artist);
+    const mainArtist = artists[0] || '';
+    if (clean && mainArtist) {
+        push(`${clean} ${mainArtist}`);
+    }
+    if (raw && mainArtist && raw !== clean) {
+        push(`${raw} ${mainArtist}`);
+    }
+    if (clean) {
+        push(`${clean} MV`);
+        push(clean);
+        push(`${clean} 官方MV`);
+        push(`${clean} 完整版`);
+        push(`${clean} 现场版`);
+    }
+    if (raw && raw !== clean) {
+        push(raw);
+    }
+    artists.slice(1).forEach((name) => {
+        if (clean) {
+            push(`${clean} ${name}`);
+        }
+    });
+    // 线索源给的检索词兜底，优先级最低
+    (hints || []).forEach((hint) => push(hint.keyword));
+    return list.slice(0, CANDIDATE_KEYWORD_LIMIT);
+}
+
+/** 网易云的 MV 搜索，借它的官方 MV 标题当线索 */
+async function fetchNeteaseMvTitles(keyword) {
+    const data = await requestJson(
+        `https://music.163.com/api/search/get?type=1014&s=${encodeURIComponent(
+            keyword,
+        )}&limit=10&offset=0`,
+        {
+            headers: {
+                'user-agent': USER_AGENT,
+                referer: 'https://music.163.com/',
+            },
+        },
+    );
+    return (data?.result?.videos || [])
+        .map((item) => ({
+            title: String(item?.title || '').trim(),
+            singer: String(item?.artistName || '').trim(),
+        }))
+        .filter((item) => item.title);
+}
+
+/** 酷狗的 MV 搜索，同样借官方 MV 标题 */
+async function fetchKugouMvTitles(keyword) {
+    const data = await requestJson(
+        `https://mobileservice.kugou.com/api/v3/search/mv?keyword=${encodeURIComponent(
+            keyword,
+        )}&page=1&pagesize=10`,
+        {
+            headers: {
+                'user-agent': USER_AGENT,
+                referer: 'https://www.kugou.com/',
+            },
+        },
+    );
+    return (data?.data?.info || [])
+        .map((item) => ({
+            title: String(item?.filename || '').trim(),
+            singer: String(item?.singername || '').trim(),
+        }))
+        .filter((item) => item.title);
+}
+
+/**
+ * 括号里只剩这些通用词时没什么检索价值，
+ * 全是这类词就直接丢掉，不然会把一堆不相干的视频标成官方 MV。
+ */
+const GENERIC_HINT_WORDS = [
+    'live',
+    'official',
+    'video',
+    'visual',
+    'mv',
+    'cover',
+    'by',
+    'remix',
+    'mix',
+    'club',
+    'feat',
+    'ft',
+    'remaster',
+    '官方',
+    '完整版',
+    '现场版',
+    '现场',
+    '动态歌词',
+    'hi-res',
+    'hires',
+    '无损',
+    '主题曲',
+    '宣传曲',
+    '电影',
+    '电影版',
+    '电视剧',
+    '预告',
+    '纯享',
+    '演唱会',
+    '动漫',
+    '版',
+    'lyric',
+    'lyrics',
+    'song',
+    'clip',
+    'version',
+    'instrumental',
+    'mono',
+    'stereo',
+    'music video',
+];
+
+/**
+ * 标题里明确写着官方出品 / MV 字样的，才算官方 MV。
+ * 用词边界是为了放过「AMV」「Lyric Video」这类蹭词的视频。
+ */
+const OFFICIAL_TITLE_RE =
+    /官方|正版|音乐录影带|\bofficial\b|\bm\/?v\b|\bmusic\s+video\b/i;
+
+/** 翻唱、教程、钢琴改编这类二次创作，官方 MV 角标不能落到它们头上 */
+const NON_OFFICIAL_TITLE_RE =
+    /翻唱|\bcover\b|remix|reaction|舞蹈|\bdance\b|piano|钢琴|纯享|演示|教程|tutorial|填词|歌词版|lyric\s*video|AI制作|AI修复|AI高清|背景视频|背景素材|模板素材|自制|混剪|鬼畜/i;
+
+/**
+ * 把线索拆成不含通用词的片段。
+ * 「太空旅客 电影中国区主题曲」里只有「太空旅客」这种片段有区分度，
+ * 「电影」「主题曲」到处都有，拿去判定只会误标。
+ */
+function splitHintKeys(piece) {
+    let rest = String(piece || '').toLowerCase();
+    for (const word of GENERIC_HINT_WORDS) {
+        rest = rest.split(word).join(' ');
+    }
+    return rest
+        .split(/[\s,，、·|/\\:：;；\-—_]+/)
+        .map((item) => normalizeText(item))
+        .filter(Boolean);
+}
+
+/**
+ * 片段里带着歌名或歌手名的，说明它只是这首歌本身，不是独有线索。
+ * 拿这种片段去判定官方 MV，任何提到这首歌的视频都会被误标。
+ */
+function isSongRelatedKey(key, songNorm, artistNorm) {
+    if (!key) {
+        return true;
+    }
+    if (songNorm && (key === songNorm || key.includes(songNorm) || songNorm.includes(key))) {
+        return true;
+    }
+    if (artistNorm) {
+        const parts = artistNorm
+            .split(/[^\p{L}\p{N}]+/u)
+            .filter((part) => part.length >= 2);
+        if (parts.some((part) => key.includes(part) || part.includes(key))) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/**
+ * 官方 MV 的标题里常有「《太空旅客》电影中国区主题曲」这类独有线索，
+ * 去掉括号就把它丢了。把括号里的内容单独抽出来当检索词。
+ */
+function extractHintKeywords(titles, songTitle, songArtist) {
+    const clean = stripDecorations(songTitle) || String(songTitle || '').trim();
+    const songNorm = normalizeText(clean);
+    const artistNorm = normalizeText(songArtist || '');
+    const hints = [];
+    const seen = new Set();
+    for (const item of titles) {
+        const title = String(item?.title || '');
+        const re = /[（(【\[]\s*([^）)】\]]{2,40}?)\s*[）)】\]]/g;
+        let matched;
+        while ((matched = re.exec(title))) {
+            const piece = matched[1]
+                .replace(/[《》"'“”]/g, ' ')
+                .replace(/\s+/g, ' ')
+                .trim();
+            if (piece.length < 2) {
+                continue;
+            }
+            // 全是通用词就没有区分度，别拿来当判定依据
+            const keys = splitHintKeys(piece).filter(
+                (key) =>
+                    key.length >= 2 &&
+                    !isSongRelatedKey(key, songNorm, artistNorm),
+            );
+            if (!keys.length) {
+                continue;
+            }
+            const fingerprint = keys.join(' ');
+            if (seen.has(fingerprint)) {
+                continue;
+            }
+            seen.add(fingerprint);
+            hints.push({keyword: `${clean} ${piece}`, piece, keys});
+        }
+    }
+    return hints.slice(0, 4);
+}
+
+/** 借网易云、酷狗的官方 MV 标题当检索线索，取不到就静默降级 */
+async function collectMvHints(title, artist) {
+    const keyword = stripDecorations(title) || String(title || '').trim();
+    if (!keyword) {
+        return [];
+    }
+    const [netease, kugou] = await Promise.all([
+        fetchNeteaseMvTitles(keyword).catch(() => []),
+        fetchKugouMvTitles(keyword).catch(() => []),
+    ]);
+    const artistKey = normalizeText(artist);
+    const picked = artistKey
+        ? kugou.filter((item) => normalizeText(item.singer).includes(artistKey))
+        : kugou;
+    return extractHintKeywords([...netease, ...picked], keyword, artist);
+}
+
+/** 并发跑一批任务，避免一次打太多请求出去 */
+async function mapWithLimit(items, limit, worker) {
+    const results = [];
+    let index = 0;
+    const runner = async () => {
+        while (index < items.length) {
+            const current = index++;
+            results[current] = await worker(items[current], current);
+        }
+    };
+    const size = Math.max(1, Math.min(limit, items.length));
+    await Promise.all(new Array(size).fill(0).map(() => runner()));
+    return results;
+}
+
 /** 画面长度要跟歌曲差不多，太短是片段，太长多半是合集 */
 function isFullLength(video, songDuration) {
     const song = Number(songDuration);
@@ -502,10 +822,11 @@ function isFullLength(video, songDuration) {
     if (!duration) {
         return true;
     }
-    if (duration < song * 0.6) {
+    // 官方 MV 常带片头片尾，比单曲长不少；阈值太紧会把正片误杀
+    if (duration < song * 0.5) {
         return false;
     }
-    if (duration > song * 3) {
+    if (duration > song * 4) {
         return false;
     }
     return true;
@@ -533,10 +854,12 @@ function toMusicItem(video) {
             typename === 'MV' ||
             /(^|,)\s*MV\s*(,|$)/i.test(String(video.tag || '')) ||
             video.forceMv === true,
+        // 标题命中了官方 MV 的独有线索
+        isOfficialMv: video.officialHint === true,
     };
 }
 
-async function searchVideos(keyword, page) {
+async function searchVideos(keyword, page, extra) {
     const mixinKey = await getMixinKey();
     const queryString = buildSignedQuery(
         {
@@ -547,6 +870,7 @@ async function searchVideos(keyword, page) {
             order: 'totalrank',
             platform: 'pc',
             web_location: 1430654,
+            ...(extra || {}),
         },
         mixinKey,
     );
@@ -620,7 +944,7 @@ const NO_LYRIC_LRC = '[00:00.00]暂无字幕';
 
 module.exports = {
     platform: PLATFORM,
-    version: '1.1.0',
+    version: '1.2.0',
     author: 'MusicFree',
     module: '搜索',
     defaultSearchType: 'music',
@@ -843,7 +1167,8 @@ module.exports = {
 
     /**
      * 按歌曲找 MV 候选。
-     * 官方 MV 常常不带 "MV" 字样，所以同时搜「歌名 歌手」和「歌名 歌手 MV」；
+     * 官方 MV 常常不带 "MV" 字样，标题也未必带歌手名，
+     * 所以检索词要覆盖歌名修饰、歌手写法、MV/官方等修饰，再借网易云、酷狗的官方 MV 标题补线索；
      * 候选的 id 是 BV 号，被选中后可以直接交给 getVideoSource 取流。
      */
     async getMusicVideoCandidates(musicItem, page) {
@@ -854,19 +1179,42 @@ module.exports = {
         }
         const current = Math.max(1, Number(page) || 1);
         const songDuration = Number(musicItem?.duration);
-        // 官方 MV 常常只写歌名，所以歌名单独再搜一遍
-        const keywords = [
-            `${title} ${artist}`.trim(),
-            `${title} ${artist} MV`.trim(),
-            title,
-        ];
+
+        // 官方 MV 的正式标题常带「电影中国区主题曲」这类唯一线索，借网易云、酷狗的搜索结果当检索词
+        const hints = await collectMvHints(title, artist);
+        const keywords = buildCandidateKeywords(title, artist, hints);
+
+        // 检索任务：靠前的关键词多翻一页，MV 所在的音乐分区再定向搜一轮
+        const tasks = [];
+        keywords.forEach((keyword, index) => {
+            tasks.push({keyword, page: current});
+            if (index < CANDIDATE_DEEP_KEYWORDS) {
+                tasks.push({keyword, page: current === 2 ? 1 : 2});
+            }
+        });
+        if (keywords.length) {
+            tasks.push({keyword: keywords[0], page: current, tid: MUSIC_TID});
+            tasks.push({keyword: keywords[0], page: current === 2 ? 1 : 2, tid: MUSIC_TID});
+        }
+
+        const resultLists = await mapWithLimit(
+            tasks,
+            CANDIDATE_CONCURRENCY,
+            async (task) => {
+                try {
+                    return await searchVideos(
+                        task.keyword,
+                        task.page,
+                        task.tid ? {tids: task.tid} : undefined,
+                    );
+                } catch (e) {
+                    return [];
+                }
+            },
+        );
+
         const seen = new Set();
         const merged = [];
-        const resultLists = await Promise.all(
-            keywords.map((keyword) =>
-                searchVideos(keyword, current).catch(() => []),
-            ),
-        );
         for (const results of resultLists) {
             for (const video of results) {
                 if (!video?.bvid || seen.has(video.bvid)) {
@@ -879,24 +1227,44 @@ module.exports = {
             }
         }
         // 标题里没有歌名的多半是蹭热度，宁可没有也不要给一堆不相干的
-        const song = normalizeText(title);
+        const song = songKey(title);
         const artistKey = normalizeText(artist);
         const named = merged.filter((video) => titleHasSong(video, song));
-        // 歌手名也在标题里才算对；否则「Hello」这种常见歌名会召回一堆儿歌、翻唱
-        let matched = artistKey.length >= 2
-            ? named.filter((video) => titleHasArtist(video, artistKey))
-            : [];
-        if (!matched.length && isDistinctSong(song)) {
-            // 没有歌手线索时放宽，但只给明确带 MV 信号的视频
-            matched = named.filter((video) => hasMvSignal(video));
-        }
+        // 歌手名在标题里是强信号；官方 MV 常常只写歌名，没有歌手线索但有 MV 信号（分区=MV、标题带官方、完整版）也留下
+        const withArtist = named.filter((video) => titleHasArtist(video, artistKey));
+        const withSignal = named.filter((video) => hasMvSignal(video));
+        // 歌手名缺失时只有足够独特的歌名才放宽，否则「Lemon」这种会召回一堆无关歌
+        const relaxed = isDistinctSong(song) ? withSignal : [];
+        const matched = [...withArtist, ...relaxed].filter(
+            (video, index, list) =>
+                list.findIndex((item) => item.bvid === video.bvid) === index,
+        );
         const scored = matched
-            .map((video) => ({video, score: scoreMv(video)}))
+            .map((video) => ({video, score: scoreMv(video, artistKey)}))
             .sort((a, b) => b.score - a.score);
         // 分数为负的基本都是凑数的，有好货的时候不必展示
         const good = scored.filter((item) => item.score > 0);
-        const picked = (good.length ? good : scored).slice(0, 15);
-        const data = picked.map((item) => toMusicItem(item.video)).filter(Boolean);
+        const picked = (good.length ? good : scored).slice(0, CANDIDATE_LIMIT);
+        // 标题命中官方 MV 的独有线索的，给个标记
+        // 太短的片段（如「对唱」）到处都有，命中了也说明不了什么
+        const hintKeys = hints
+            .flatMap((hint) => hint.keys || [])
+            .filter((key) => key.length >= 3);
+        const data = picked
+            .map((item) => {
+                const rawTitle = stripHtml(item.video.title);
+                const videoTitle = normalizeText(rawTitle);
+                // 命中线索片段，或者标题里直接写着官方出品，都算官方 MV
+                const official =
+                    !NON_OFFICIAL_TITLE_RE.test(rawTitle) &&
+                    (OFFICIAL_TITLE_RE.test(rawTitle) ||
+                        hintKeys.some((key) => videoTitle.includes(key)));
+                if (official) {
+                    item.video.officialHint = true;
+                }
+                return toMusicItem(item.video);
+            })
+            .filter(Boolean);
         return {
             isEnd: data.length === 0,
             data,

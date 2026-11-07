@@ -593,6 +593,8 @@ function extractResourceId(input) {
 
 module.exports = {
     platform: PLATFORM,
+    // platform 是数据键，改名会让历史条目对不上；界面显示用这个名字
+    displayName: '网易音乐',
     version: '1.2.0',
     author: 'MusicFree',
     module: '榜单',

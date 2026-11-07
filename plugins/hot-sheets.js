@@ -649,6 +649,8 @@ function extractResourceId(input) {
 
 module.exports = {
     platform: PLATFORM,
+    // platform 是数据键，改名会让历史条目对不上；界面显示用这个名字
+    displayName: '网易热门',
     version: '1.2.0',
     author: 'MusicFree',
     description: '网易云音乐热门歌单：标签分类浏览、完整歌单曲目、在线播放与歌词',
