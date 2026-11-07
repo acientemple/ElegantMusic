@@ -291,44 +291,93 @@ function matchScore(candidateTitle, candidateArtist, title, artist) {
 
 /**
  * 酷狗歌词：krcs.kugou.com 搜候选，再从 lyrics.kugou.com 下载
- * 关键词必须带歌手，只给歌名基本搜不到候选
+ *
+ * krcs 的检索只认歌曲的 hash，光给「歌名 歌手」搜不到候选，
+ * 所以先用歌曲检索挑出对得上的那首，拿到 hash 与专辑 id 再查歌词。
+ * 带 hash 与专辑 id 查回来的候选里才有正确的歌手名
  */
 async function fetchKugouLyric(title, artist, durationSec) {
     const keyword = [title, artist].filter(Boolean).join(' ').trim();
     if (!keyword) {
         return null;
     }
-    const duration = Math.round(Number(durationSec) || 0) * 1000;
+    const songs = await searchSongs(keyword, 10).catch(() => []);
+    if (!songs.length) {
+        return null;
+    }
+    // 歌名与歌手都对得上的那首才是要的
+    const bestSong = songs
+        .map((song) => ({
+            song,
+            score: matchScore(
+                song.SongName || '',
+                song.SingerName || '',
+                title,
+                artist,
+            ),
+        }))
+        .sort((a, b) => b.score - a.score)
+        .find((item) => item.score >= 4)?.song;
+    if (!bestSong?.FileHash) {
+        return null;
+    }
+    const songDuration = Math.round(Number(bestSong.Duration) || 0);
     const data = await getJson(
         LYRIC_SEARCH_API,
-        { ver: 1, man: 'yes', client: 'pc', keyword, duration: duration || undefined },
+        {
+            ver: 1,
+            man: 'yes',
+            client: 'pc',
+            hash: bestSong.FileHash,
+            album_id: bestSong.AlbumID || undefined,
+            duration: songDuration ? songDuration * 1000 : undefined,
+        },
         { timeout: LYRIC_TIMEOUT },
     ).catch(() => null);
     const candidates = data?.candidates || [];
     if (!candidates.length) {
         return null;
     }
-    // 同一个歌名下常挂着「氛围版 /  remix / 现场版」，时长对不上的先剔掉
-    const tolerance = Math.max(10000, duration * 0.12);
-    const filtered = duration
-        ? candidates.filter(
-              (item) =>
-                  !item.duration || Math.abs(Number(item.duration) - duration) <= tolerance,
-          )
-        : candidates;
-    const pool = filtered.length ? filtered : candidates;
-    const ranked = pool
-        .map((item) => ({
-            item,
-            score:
-                matchScore(item.song || '', item.singer || '', title, artist) * 100 +
-                // 酷狗自带的相关度（10~60）与来源标记，作为次要权重
-                (Number(item.score) || 0) +
-                (/官方推荐歌词/.test(String(item.product_from || '')) ? 30 : 0) +
-                (duration && item.duration
-                    ? Math.max(0, 10 - Math.abs(Number(item.duration) - duration) / 1000)
-                    : 0),
-        }))
+    // 同一个歌名下常挂着「氛围版 / remix / 现场版」，按歌名与时长挑出对得上的
+    const ranked = candidates
+        .map((item) => {
+            let score = 0;
+            const ct = lyricKey(item.song || '');
+            const nt = lyricKey(bestSong.SongName || '');
+            if (ct && nt) {
+                if (ct === nt) {
+                    score += 100;
+                } else if (
+                    lyricLooseKey(item.song) === lyricLooseKey(bestSong.SongName)
+                ) {
+                    score += 80;
+                } else if (
+                    lyricLooseKey(item.song).includes(
+                        lyricLooseKey(bestSong.SongName),
+                    )
+                ) {
+                    score += 40;
+                }
+            }
+            const itemDuration = Math.round(Number(item.duration || 0) / 1000);
+            if (songDuration && itemDuration) {
+                const diff = Math.abs(itemDuration - songDuration);
+                if (diff <= 3) {
+                    score += 20;
+                } else if (diff <= 10) {
+                    score += 10;
+                } else if (diff <= 30) {
+                    score -= 10;
+                } else {
+                    score -= 30;
+                }
+            }
+            if (/官方推荐歌词/.test(String(item.product_from || ''))) {
+                score += 15;
+            }
+            score += Number(item.score) || 0;
+            return { item, score };
+        })
         .sort((a, b) => b.score - a.score);
     const best = ranked[0];
     if (!best || !best.item.accesskey) {
@@ -641,7 +690,8 @@ function buildAlternativeQueries(title, artist) {
         queries.push(clean);
     }
     queries.push(title);
-    if (artist) {
+    // 检索词里已经带了歌手名就不用再拼一次，白白多打一次接口
+    if (artist && !lyricKey(title).includes(lyricKey(artist))) {
         queries.push(`${title} ${artist}`);
     }
     return queries.filter((query, index) => query && queries.indexOf(query) === index);
@@ -738,7 +788,7 @@ async function pickFullTracks(candidates, origin) {
 /* ---------------------------- 插件 ---------------------------- */
 
 module.exports = {
-    version: '1.1.0',
+    version: '1.2.0',
     module: '榜单',
     platform: PLATFORM,
     author: '',
@@ -874,8 +924,9 @@ module.exports = {
     },
 
     /** 查找同一首歌的其他可完整播放版本 */
-    async getMusicAlternatives(musicItem) {
-        const title = String(musicItem?.title || '').trim();
+    async getMusicAlternatives(musicItem, page, keyword) {
+        // 用户可以自定义检索词，替换掉默认的歌名；歌手与时长基准仍取原曲
+        const title = String(keyword ?? '').trim() || String(musicItem?.title || '').trim();
         const artist = String(musicItem?.artist || '').trim();
         if (!title) {
             throw new Error('缺少歌曲名');
@@ -927,7 +978,8 @@ module.exports = {
             candidates = all;
         }
 
-        const data = await pickFullTracks(candidates, musicItem);
+        // 检索词换过了，比对时也按新歌名来，原曲的 id/歌手/时长不变
+        const data = await pickFullTracks(candidates, { ...musicItem, title });
         return {
             isEnd: true,
             data: data.slice(0, ALTERNATIVE_LIMIT),

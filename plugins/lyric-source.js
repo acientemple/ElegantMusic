@@ -2,7 +2,7 @@
  * 歌词聚合 —— 多来源歌词检索插件
  *
  * 检索时同时问多个歌词平台，把同一首歌的结果合并成一条；
- * 取词时逐个来源尝试，挑带时间轴、行数多、有翻译的那一份。
+ * 取词时逐个来源尝试，挑与目标歌名歌手最贴合、时间轴完整的那一份。
  * 平台标识：歌词聚合
  */
 
@@ -23,16 +23,14 @@ const CALL_BUDGET = 8500;
 // 同一首歌在每个平台最多保留几条来源，避免为重复结果反复发请求
 const MAX_REFS_PER_SOURCE = 3;
 
+const KUGOU_SONG_SEARCH_API = 'https://songsearch.kugou.com/song_search_v2';
+const KUGOU_LYRIC_SEARCH_API = 'https://krcs.kugou.com/search';
+const KUGOU_LYRIC_DOWNLOAD_API = 'https://lyrics.kugou.com/download';
+
 const NO_LYRIC_LRC = '[00:00.00]暂无歌词';
 
 // 检索顺序即优先级：合并结果按它排序，挑歌词时也按它破平局
-const SOURCE_ORDER = ['netease', 'qq', 'lrclib'];
-
-const SOURCE_NAME = {
-    netease: '网易云音乐',
-    qq: 'QQ音乐',
-    lrclib: 'LRCLIB',
-};
+const SOURCE_ORDER = ['netease', 'qq', 'kugou', 'lrclib'];
 
 function getUserVariables() {
     try {
@@ -63,6 +61,18 @@ function buildNeteaseCookie() {
         .join('; ');
 }
 
+/** 有些接口把 JSON 当字符串返回，先试着解析一次 */
+function parseMaybeJson(data) {
+    if (typeof data !== 'string') {
+        return data;
+    }
+    try {
+        return JSON.parse(data);
+    } catch (e) {
+        return data;
+    }
+}
+
 async function httpGet(url, params, headers, deadline) {
     const left = deadline ? deadline - Date.now() : REQUEST_TIMEOUT;
     const timeout = Math.max(500, Math.min(REQUEST_TIMEOUT, left));
@@ -74,7 +84,140 @@ async function httpGet(url, params, headers, deadline) {
         },
         timeout,
     });
-    return response.data;
+    return parseMaybeJson(response.data);
+}
+
+/* ------------------------------ 基础工具 ------------------------------ */
+
+/** 酷狗的歌词内容是 base64 的 */
+function decodeBase64(text) {
+    const raw = String(text || '');
+    if (!raw) {
+        return '';
+    }
+    try {
+        if (typeof Buffer !== 'undefined') {
+            return Buffer.from(raw, 'base64').toString('utf8');
+        }
+    } catch (e) {
+        // 落到下面的 atob 分支
+    }
+    try {
+        const binary = atob(raw);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) {
+            bytes[i] = binary.charCodeAt(i);
+        }
+        return new TextDecoder('utf-8').decode(bytes);
+    } catch (e) {
+        return '';
+    }
+}
+
+/** 去掉 [ti:] [ar:] 这类头部信息 */
+function cleanLyricHeader(lrc) {
+    return String(lrc || '')
+        .split(/\r?\n/)
+        .filter((line) => !/^\s*\[(ti|ar|al|by|id)\s*:/i.test(line))
+        .join('\n');
+}
+
+/** 归一化歌名 / 歌手：去掉大小写、空白与标点 */
+function lyricKey(text) {
+    return String(text || '')
+        .toLowerCase()
+        .replace(/[\s·・\-_~,，。!！?？'"“”]/g, '');
+}
+
+/** 去掉括号里的修饰（Live / DJ版 / 官方版…） */
+function lyricLooseKey(text) {
+    return lyricKey(text).replace(/[（(\[【《][^）)\]】》]*[）)\]】》]/g, '');
+}
+
+/** 歌名与歌手都对得上才算命中 */
+function matchScore(candidateTitle, candidateArtist, title, artist) {
+    const ct = lyricKey(candidateTitle);
+    const nt = lyricKey(title);
+    if (!ct || !nt) {
+        return 0;
+    }
+    let score = 0;
+    if (ct === nt) {
+        score += 4;
+    } else if (lyricLooseKey(candidateTitle) === lyricLooseKey(title)) {
+        score += 3;
+    } else if (lyricLooseKey(candidateTitle).includes(lyricLooseKey(title))) {
+        score += 1;
+    }
+    const ca = lyricKey(candidateArtist);
+    const na = lyricKey(artist);
+    if (na && ca) {
+        if (ca === na) {
+            score += 3;
+        } else if (ca.includes(na) || na.includes(ca)) {
+            score += 2;
+        }
+    }
+    return score;
+}
+
+/** 版本类标记。画质类的修饰（无损 / 320K / FLAC）不算版本差异 */
+const VERSION_PATTERNS = [
+    /\blive\b|现场|演唱会|实况/i,
+    /\bdj\b/i,
+    /remix|混音/i,
+    /翻唱|\bcover\b/i,
+    /instrumental|伴奏|纯音乐|纯歌/i,
+    /\bdemo\b|小样/i,
+    /\bacoustic\b/i,
+    /\bver\.?\b|\bversion\b|版本/i,
+    /原版|官方版|正版|完整版/i,
+    /remaster|重制/i,
+];
+
+function versionKinds(text) {
+    const source = String(text || '');
+    if (!source.trim()) {
+        return [];
+    }
+    return VERSION_PATTERNS.filter((pattern) => pattern.test(source));
+}
+
+/**
+ * 版本不一致要扣分。
+ * 候选比目标多出版本标记（原版 vs Live / DJ / 翻唱）扣得最重，
+ * 因为这类版本行数往往更多，只看行数会被它们顶掉
+ */
+function versionPenalty(candidateTitle, targetTitle) {
+    if (!String(targetTitle || '').trim()) {
+        return 0;
+    }
+    const candidate = versionKinds(candidateTitle);
+    const target = versionKinds(targetTitle);
+    if (!candidate.length && !target.length) {
+        return 0;
+    }
+    if (!candidate.length) {
+        return 60;
+    }
+    if (!target.length) {
+        return 120;
+    }
+    const same =
+        candidate.length === target.length &&
+        candidate.every((pattern, index) => pattern === target[index]);
+    if (same) {
+        return 0;
+    }
+    const candidateExtra = candidate.filter((item) => !target.includes(item));
+    const targetExtra = target.filter((item) => !candidate.includes(item));
+    if (candidateExtra.length && !targetExtra.length) {
+        return 120;
+    }
+    if (!candidateExtra.length && targetExtra.length) {
+        return 60;
+    }
+    return 150;
 }
 
 /* ------------------------------ 检索 ------------------------------ */
@@ -151,6 +294,46 @@ async function searchQQ(query, page, deadline) {
         }));
 }
 
+/**
+ * 酷狗的歌词检索接口只认歌曲的 hash，光给歌名搜不到候选，
+ * 所以先用歌曲检索拿到 hash 与专辑，再据此查歌词
+ */
+async function searchKugou(query, page, deadline) {
+    const data = await httpGet(
+        KUGOU_SONG_SEARCH_API,
+        {
+            keyword: query,
+            page: Math.max(1, page),
+            pagesize: PAGE_SIZE,
+            platform: 'WebFilter',
+            userid: 0,
+            clientver: 2000,
+            iscorrection: 1,
+            privilege_filter: 0,
+            area_code: 1,
+            filter: 10,
+        },
+        { referer: 'https://www.kugou.com/' },
+        deadline,
+    );
+    const list = data?.data?.lists || [];
+    return list
+        .filter((item) => item?.FileHash)
+        .map((item) => ({
+            source: 'kugou',
+            sourceId: String(item.FileHash),
+            title: item.SongName || '',
+            artist: item.SingerName || '',
+            album: item.AlbumName || '',
+            artwork: String(item.Image || '')
+                .replace(/\{size\}/g, '400')
+                .replace(/^http:\/\//, 'https://'),
+            duration: Number(item.Duration) || 0,
+            // 取歌词时要用到专辑 id 与时长
+            albumId: String(item.AlbumID || ''),
+        }));
+}
+
 async function searchLrclib(query, page, deadline) {
     const data = await httpGet(
         'https://lrclib.net/api/search',
@@ -214,6 +397,96 @@ async function fetchQQLyric(sourceId, deadline) {
     };
 }
 
+/**
+ * 酷狗的歌词候选：一个歌名下常挂着氛围版、伴奏版、现场版，
+ * 按歌名与时长挑出与这首歌对得上的那一条
+ */
+function pickKugouCandidate(candidates, ref) {
+    const targetTitle = ref?.t || '';
+    const targetDuration = Number(ref?.d || 0);
+    return candidates
+        .map((item) => {
+            let score = 0;
+            const ct = lyricKey(item.song || '');
+            const nt = lyricKey(targetTitle);
+            if (ct && nt) {
+                if (ct === nt) {
+                    score += 100;
+                } else if (
+                    lyricLooseKey(item.song) === lyricLooseKey(targetTitle)
+                ) {
+                    score += 80;
+                } else if (
+                    lyricLooseKey(item.song).includes(lyricLooseKey(targetTitle))
+                ) {
+                    score += 40;
+                }
+            }
+            const duration = Math.round(Number(item.duration || 0) / 1000);
+            if (targetDuration && duration) {
+                const diff = Math.abs(duration - targetDuration);
+                if (diff <= 3) {
+                    score += 20;
+                } else if (diff <= 10) {
+                    score += 10;
+                } else if (diff <= 30) {
+                    score -= 10;
+                } else {
+                    score -= 30;
+                }
+            }
+            if (/官方推荐歌词/.test(String(item.product_from || ''))) {
+                score += 15;
+            }
+            score += Number(item.score) || 0;
+            return { item, score };
+        })
+        .sort((a, b) => b.score - a.score)[0]?.item || null;
+}
+
+async function fetchKugouLyric(ref, deadline) {
+    const durationMs = Math.round(Number(ref?.d || 0)) * 1000;
+    const data = await httpGet(
+        KUGOU_LYRIC_SEARCH_API,
+        {
+            ver: 1,
+            man: 'yes',
+            client: 'pc',
+            hash: ref.i,
+            album_id: ref.al || undefined,
+            duration: durationMs || undefined,
+        },
+        { referer: 'https://www.kugou.com/' },
+        deadline,
+    );
+    const candidates = data?.candidates || [];
+    if (!candidates.length) {
+        return null;
+    }
+    const best = pickKugouCandidate(candidates, ref);
+    if (!best?.accesskey) {
+        return null;
+    }
+    const payload = await httpGet(
+        KUGOU_LYRIC_DOWNLOAD_API,
+        {
+            ver: 1,
+            client: 'pc',
+            id: best.id,
+            accesskey: best.accesskey,
+            fmt: 'lrc',
+            charset: 'utf8',
+        },
+        { referer: 'https://www.kugou.com/' },
+        deadline,
+    );
+    const rawLrc = decodeBase64(payload?.content);
+    if (!rawLrc) {
+        return null;
+    }
+    return { rawLrc: cleanLyricHeader(rawLrc), translation: '' };
+}
+
 async function fetchLrclibLyric(ref, deadline) {
     const data = await httpGet(
         'https://lrclib.net/api/get',
@@ -227,20 +500,25 @@ async function fetchLrclibLyric(ref, deadline) {
     };
 }
 
-async function fetchRefLyric(ref, deadline) {
+async function fetchRefLyric(ref, deadline, target) {
     try {
         let lyric = null;
         if (ref.s === 'netease') {
             lyric = await fetchNeteaseLyric(ref.i, deadline);
         } else if (ref.s === 'qq') {
             lyric = await fetchQQLyric(ref.i, deadline);
+        } else if (ref.s === 'kugou') {
+            lyric = await fetchKugouLyric(ref, deadline);
         } else if (ref.s === 'lrclib') {
             lyric = await fetchLrclibLyric(ref, deadline);
         }
         if (!lyric) {
             return null;
         }
-        return { ...lyric, score: scoreLyric(lyric) };
+        return {
+            ...lyric,
+            score: scoreLyric(lyric, ref, target),
+        };
     } catch (e) {
         return null;
     }
@@ -281,15 +559,49 @@ function isUsableLyric(lrc) {
     return true;
 }
 
-/** 时间轴行数越多越好，有翻译再加一笔 */
-function scoreLyric(lyric) {
+/** 正文中出现正常文字之外的字符，多半是编码错乱 */
+const GOOD_CHAR =
+    /[一-鿿㐀-䶿぀-ヿ가-힯　-〿＀-￯A-Za-z0-9\s.,!?;:'"()[\]_~|-]/;
+
+function countGarbageLines(lrc) {
+    if (!lrc) {
+        return 0;
+    }
+    const lines = lrc.split(/\r?\n/).filter((line) => TIMED_LINE.test(line));
+    let count = 0;
+    lines.forEach((line) => {
+        const text = line
+            .replace(/\[\d{1,3}:\d{1,2}([.:]\d{1,3})?\]/g, '')
+            .trim();
+        if (!text) {
+            return;
+        }
+        for (let index = 0; index < text.length; index++) {
+            if (!GOOD_CHAR.test(text[index])) {
+                count++;
+                return;
+            }
+        }
+    });
+    return count;
+}
+
+/**
+ * 打分以「与目标歌名歌手的匹配度」为主。
+ * 早先只看时间轴行数，DJ 版、Live 版这类行数更多的版本总是胜出，
+ * 现在匹配度占主导，行数与翻译只用来在同样贴合的候选之间破平局
+ */
+function scoreLyric(lyric, ref, target) {
     if (!isUsableLyric(lyric?.rawLrc)) {
         return -1;
     }
-    let score = Math.min(countTimedLines(lyric.rawLrc), 60);
+    let score = matchScore(ref?.t, ref?.a, target?.title, target?.artist) * 100;
+    score += Math.min(countTimedLines(lyric.rawLrc), 60);
     if (lyric?.translation?.trim()) {
         score += 25;
     }
+    score -= countGarbageLines(lyric.rawLrc) * 100;
+    score -= versionPenalty(ref?.t, target?.title);
     return score;
 }
 
@@ -373,12 +685,22 @@ function dedupeRefs(refs) {
 /** 同一首歌在多个平台各有一条，留下来源清单 */
 function buildRefs(entries) {
     return dedupeRefs(
-        entries.map((entry) => ({
-            s: entry.source,
-            i: entry.sourceId,
-            t: entry.title,
-            a: entry.artist,
-        })),
+        entries.map((entry) => {
+            const ref = {
+                s: entry.source,
+                i: entry.sourceId,
+                t: entry.title,
+                a: entry.artist,
+            };
+            // 酷狗取歌词时要用到专辑 id 与时长
+            if (entry.albumId) {
+                ref.al = entry.albumId;
+            }
+            if (entry.duration) {
+                ref.d = entry.duration;
+            }
+            return ref;
+        }),
     );
 }
 
@@ -398,7 +720,7 @@ function hashText(text) {
  */
 function mergeEntries(lists) {
     const groups = new Map();
-    lists.forEach((list, sourceIndex) => {
+    lists.forEach((list) => {
         (list || []).forEach((entry, index) => {
             const key = groupKeyOf(entry);
             let group = groups.get(key);
@@ -451,7 +773,7 @@ function displayScore(entry) {
 function toLyricItem(group) {
     const entries = group.entries;
     const refs = buildRefs(entries);
-    const lyricKey = JSON.stringify(refs);
+    const lyricKeyText = JSON.stringify(refs);
     const display = entries
         .slice()
         .sort(
@@ -461,7 +783,7 @@ function toLyricItem(group) {
         )[0];
     const withArtwork = entries.find((entry) => entry.artwork);
     return {
-        id: hashText(lyricKey),
+        id: hashText(lyricKeyText),
         platform: PLATFORM,
         title: display.title || '未知歌曲',
         artist: display.artist || '未知歌手',
@@ -469,7 +791,7 @@ function toLyricItem(group) {
         artwork: withArtwork?.artwork || '',
         duration: display.duration || 0,
         // 这两个字段会随关联一起存下来，取词失败时还能按歌名重新找
-        lyricKey,
+        lyricKey: lyricKeyText,
         lyricTitle: display.title || '',
         lyricArtist: display.artist || '',
     };
@@ -492,6 +814,7 @@ async function searchAllSources(query, page, deadline) {
         [
             searchNetease(query, page, deadline).catch(() => []),
             searchQQ(query, page, deadline).catch(() => []),
+            searchKugou(query, page, deadline).catch(() => []),
             searchLrclib(query, page, deadline).catch(() => []),
         ],
     );
@@ -500,7 +823,7 @@ async function searchAllSources(query, page, deadline) {
 
 module.exports = {
     platform: PLATFORM,
-    version: '1.1.0',
+    version: '1.2.0',
     author: 'MusicFree',
     module: '歌词',
     defaultSearchType: 'lyric',
@@ -508,7 +831,9 @@ module.exports = {
     // 关联歌词时把来源信息一起存下来，取词时才知道该问哪些平台
     primaryKey: ['lyricKey', 'lyricTitle', 'lyricArtist'],
     hints: {
-        lyric: ['同时检索网易云音乐、QQ音乐与 LRCLIB，自动合并同一首歌'],
+        lyric: [
+            '同时检索网易云音乐、QQ音乐、酷狗音乐与 LRCLIB，自动合并同一首歌',
+        ],
     },
     userVariables: [
         {
@@ -537,9 +862,14 @@ module.exports = {
 
     async getLyric(musicItem) {
         const deadline = Date.now() + CALL_BUDGET;
+        // 目标就是这首歌本身，用来判断哪一份歌词才是对的
+        const target = {
+            title: musicItem?.title || musicItem?.lyricTitle || '',
+            artist: musicItem?.artist || musicItem?.lyricArtist || '',
+        };
         const refs = dedupeRefs(decodeRefs(musicItem?.lyricKey));
         const lyrics = await Promise.all(
-            refs.map((ref) => fetchRefLyric(ref, deadline)),
+            refs.map((ref) => fetchRefLyric(ref, deadline, target)),
         );
         let best = pickBestLyric(lyrics);
 
@@ -554,18 +884,25 @@ module.exports = {
                 const retryRefs = [];
                 groups.forEach((group) => {
                     group.entries.forEach((entry) => {
-                        retryRefs.push({
+                        const ref = {
                             s: entry.source,
                             i: entry.sourceId,
                             t: entry.title,
                             a: entry.artist,
-                        });
+                        };
+                        if (entry.albumId) {
+                            ref.al = entry.albumId;
+                        }
+                        if (entry.duration) {
+                            ref.d = entry.duration;
+                        }
+                        retryRefs.push(ref);
                     });
                 });
                 const retryLyrics = await Promise.all(
                     dedupeRefs(retryRefs)
                         .slice(0, 6)
-                        .map((ref) => fetchRefLyric(ref, deadline)),
+                        .map((ref) => fetchRefLyric(ref, deadline, target)),
                 );
                 best = pickBestLyric(retryLyrics);
             }

@@ -789,7 +789,8 @@ function buildQueries(title, artist) {
         queries.push(clean);
     }
     queries.push(title);
-    if (artist) {
+    // 检索词里已经带了歌手名就不用再拼一次，白白多打一次接口
+    if (artist && !normalizeTitle(title).includes(normalizeTitle(artist))) {
         queries.push(`${title} ${artist}`);
     }
     return queries.filter(
@@ -841,8 +842,9 @@ module.exports = {
         };
     },
 
-    async getMusicAlternatives(musicItem) {
-        const title = String(musicItem?.title || '').trim();
+    async getMusicAlternatives(musicItem, page, keyword) {
+        // 用户可以自定义检索词，替换掉默认的歌名；歌手与时长基准仍取原曲
+        const title = String(keyword ?? '').trim() || String(musicItem?.title || '').trim();
         const artist = String(musicItem?.artist || '').trim();
         if (!title) {
             throw new Error('缺少歌曲名');
@@ -895,7 +897,8 @@ module.exports = {
             candidates = Array.from(collected.values());
         }
 
-        const data = await pickFullTrack(candidates, musicItem);
+        // 检索词换过了，比对时也按新歌名来，原曲的 id/歌手/时长不变
+        const data = await pickFullTrack(candidates, { ...musicItem, title });
         return {
             isEnd: true,
             data: data.slice(0, ALTERNATIVE_LIMIT),
