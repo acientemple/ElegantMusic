@@ -1171,18 +1171,29 @@ module.exports = {
      * 所以检索词要覆盖歌名修饰、歌手写法、MV/官方等修饰，再借网易云、酷狗的官方 MV 标题补线索；
      * 候选的 id 是 BV 号，被选中后可以直接交给 getVideoSource 取流。
      */
-    async getMusicVideoCandidates(musicItem, page) {
+    async getMusicVideoCandidates(musicItem, page, keyword) {
+        // 用户可以在界面上改检索词，改了就按他给的词找
+        const custom = String(keyword ?? '').trim();
         const title = String(musicItem?.title ?? '').trim();
         const artist = String(musicItem?.artist ?? '').trim();
-        if (!title) {
+        if (!custom && !title) {
             return {isEnd: true, data: []};
         }
         const current = Math.max(1, Number(page) || 1);
         const songDuration = Number(musicItem?.duration);
 
-        // 官方 MV 的正式标题常带「电影中国区主题曲」这类唯一线索，借网易云、酷狗的搜索结果当检索词
-        const hints = await collectMvHints(title, artist);
-        const keywords = buildCandidateKeywords(title, artist, hints);
+        let hints = [];
+        let keywords;
+        if (custom) {
+            // 自定义检索词：直接按这个词搜
+            keywords = [custom, `${custom} MV`, `${custom} 官方MV`].filter(
+                (item, index, list) => list.indexOf(item) === index,
+            );
+        } else {
+            // 官方 MV 的正式标题常带「电影中国区主题曲」这类唯一线索，借网易云、酷狗的搜索结果当检索词
+            hints = await collectMvHints(title, artist);
+            keywords = buildCandidateKeywords(title, artist, hints);
+        }
 
         // 检索任务：靠前的关键词多翻一页，MV 所在的音乐分区再定向搜一轮
         const tasks = [];
@@ -1221,7 +1232,7 @@ module.exports = {
                     continue;
                 }
                 seen.add(video.bvid);
-                if (isSingleMv(video) && isFullLength(video, songDuration)) {
+                if (isSingleMv(video) && (custom || isFullLength(video, songDuration))) {
                     merged.push(video);
                 }
             }
@@ -1229,22 +1240,31 @@ module.exports = {
         // 标题里没有歌名的多半是蹭热度，宁可没有也不要给一堆不相干的
         const song = songKey(title);
         const artistKey = normalizeText(artist);
-        const named = merged.filter((video) => titleHasSong(video, song));
-        // 歌手名在标题里是强信号；官方 MV 常常只写歌名，没有歌手线索但有 MV 信号（分区=MV、标题带官方、完整版）也留下
-        const withArtist = named.filter((video) => titleHasArtist(video, artistKey));
-        const withSignal = named.filter((video) => hasMvSignal(video));
-        // 歌手名缺失时只有足够独特的歌名才放宽，否则「Lemon」这种会召回一堆无关歌
-        const relaxed = isDistinctSong(song) ? withSignal : [];
-        const matched = [...withArtist, ...relaxed].filter(
-            (video, index, list) =>
-                list.findIndex((item) => item.bvid === video.bvid) === index,
-        );
+        let matched;
+        if (custom) {
+            // 自定义检索词：搜出来的就是用户要找的，按相关度排
+            matched = merged;
+        } else {
+            const named = merged.filter((video) => titleHasSong(video, song));
+            // 歌手名在标题里是强信号；官方 MV 常常只写歌名，没有歌手线索但有 MV 信号（分区=MV、标题带官方、完整版）也留下
+            const withArtist = named.filter((video) => titleHasArtist(video, artistKey));
+            const withSignal = named.filter((video) => hasMvSignal(video));
+            // 歌手名缺失时只有足够独特的歌名才放宽，否则「Lemon」这种会召回一堆无关歌
+            const relaxed = isDistinctSong(song) ? withSignal : [];
+            matched = [...withArtist, ...relaxed].filter(
+                (video, index, list) =>
+                    list.findIndex((item) => item.bvid === video.bvid) === index,
+            );
+        }
         const scored = matched
             .map((video) => ({video, score: scoreMv(video, artistKey)}))
             .sort((a, b) => b.score - a.score);
         // 分数为负的基本都是凑数的，有好货的时候不必展示
         const good = scored.filter((item) => item.score > 0);
-        const picked = (good.length ? good : scored).slice(0, CANDIDATE_LIMIT);
+        const picked = (custom ? scored : good.length ? good : scored).slice(
+            0,
+            CANDIDATE_LIMIT,
+        );
         // 标题命中官方 MV 的独有线索的，给个标记
         // 太短的片段（如「对唱」）到处都有，命中了也说明不了什么
         const hintKeys = hints
