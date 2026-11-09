@@ -43,6 +43,10 @@ const QQ_LYRIC_API = 'https://c.y.qq.com/lyric/fcgi-bin/fcg_query_lyric_new.fcg'
 const QQ_LINK_API = 'https://api.vkeys.cn/music/tencent/song/link';
 const LRCLIB_API = 'https://lrclib.net/api/get';
 
+/** 伴奏版标题里常见的标记 */
+const INSTRUMENTAL_MARKER =
+    /伴奏|纯音乐|纯歌|纯钢琴|钢琴伴奏|人声伴奏|instrumental|karaoke|卡拉\s*ok/i;
+
 const RANK_PAGE_SIZE = 50;
 const SEARCH_PAGE_SIZE = 30;
 const LYRIC_TIMEOUT = 6000;
@@ -600,9 +604,54 @@ async function mapWithLimit(items, limit, worker) {
     return results;
 }
 
+/** 去掉标题里的伴奏修饰，剩下的才是原曲名 */
+function stripInstrumentalTags(text) {
+    return String(text || '')
+        // 括号里带伴奏标记的，整段去掉
+        .replace(/[（(【\[《][^）)】\]》]*[）)】\]》]/g, (part) =>
+            INSTRUMENTAL_MARKER.test(part) ? '' : part,
+        )
+        // 裸露的标记词
+        .replace(INSTRUMENTAL_MARKER, '')
+        .replace(/\s+/g, ' ')
+        .trim();
+}
+
+/**
+ * 候选伴奏版跟目标有多像：
+ * 歌名一致 100，包含关系 60，无关 0；歌手也一致再加 20
+ */
+function instrumentalTitleScore(
+    originalTitle,
+    candidateTitle,
+    originalArtist,
+    candidateArtist,
+) {
+    const target = stripInstrumentalTags(originalTitle).toLowerCase();
+    const candidate = stripInstrumentalTags(candidateTitle).toLowerCase();
+    if (!target || !candidate) {
+        return 0;
+    }
+    let score = 0;
+    if (target === candidate) {
+        score = 100;
+    } else if (candidate.includes(target) || target.includes(candidate)) {
+        score = 60;
+    }
+    if (!score) {
+        return 0;
+    }
+    const targetArtist = String(originalArtist || '').trim();
+    const candidateArtistName = String(candidateArtist || '').trim();
+    if (targetArtist && candidateArtistName && targetArtist === candidateArtistName) {
+        // 原唱的伴奏最贴，时长轴才对得上
+        score += 20;
+    }
+    return score;
+}
+
 /** 歌名匹配度：3=一致，1=候选以原歌名开头，0=无关 */
-function titleMatchLevel(originTitle, candidateTitle) {
-    const origin = lyricLooseKey(originTitle);
+function titleMatchLevel(originTitle, candidateTitle) {    const origin = lyricLooseKey(originTitle);
     const candidate = lyricLooseKey(candidateTitle);
     if (!origin || !candidate) {
         return 0;
@@ -788,7 +837,7 @@ async function pickFullTracks(candidates, origin) {
 /* ---------------------------- 插件 ---------------------------- */
 
 module.exports = {
-    version: '1.2.0',
+    version: '1.3.0',
     module: '榜单',
     platform: PLATFORM,
     author: '',
@@ -894,6 +943,72 @@ module.exports = {
             },
             quality: fromQQ.kbps || 'standard',
         };
+    },
+
+    /**
+     * 伴奏版音源（唱卡拉OK 时放纯伴奏）。
+     * 搜「歌名 伴奏」，挑一条标题确实带伴奏标记、时长又和原曲接近的
+     */
+    async getInstrumental(musicItem) {
+        const title = String(musicItem?.title || '').trim();
+        if (!title) {
+            return null;
+        }
+        const duration = Number(musicItem?.duration) || 0;
+        const data = await getJson(SEARCH_API, {
+            keyword: `${title} 伴奏`,
+            page: 1,
+            pagesize: SEARCH_PAGE_SIZE,
+            platform: 'WebFilter',
+            userid: 0,
+            clientver: 2000,
+            iscorrection: 1,
+            privilege_filter: 0,
+            area_code: 1,
+            filter: 10,
+        }).catch(() => null);
+        const list = data?.data?.lists || [];
+
+        const candidates = list
+            .filter((song) => INSTRUMENTAL_MARKER.test(String(song?.SongName || '')))
+            .filter((song) => {
+                // 时长得跟原曲对得上，否则 karaoke 的时间轴会整个错位
+                const songDuration = Number(song?.Duration) || 0;
+                if (!duration || !songDuration) {
+                    return true;
+                }
+                const diff = Math.abs(songDuration - duration);
+                return diff <= Math.max(10, duration * 0.12);
+            })
+            .map((song) => ({
+                song,
+                score: instrumentalTitleScore(
+                    title,
+                    String(song?.SongName || ''),
+                    String(musicItem?.artist || ''),
+                    String(song?.SingerName || ''),
+                ),
+            }))
+            .sort((a, b) => b.score - a.score);
+
+        for (const item of candidates) {
+            const hash = item?.song?.FileHash;
+            if (!hash) {
+                continue;
+            }
+            const source = await fetchPlayUrl(hash);
+            if (source?.url) {
+                return {
+                    url: source.url,
+                    headers: {
+                        'user-agent': USER_AGENT,
+                        referer: 'https://www.kugou.com/',
+                    },
+                    quality: 'standard',
+                };
+            }
+        }
+        return null;
     },
 
     /** 歌词：酷狗 → QQ → LRCLIB */
