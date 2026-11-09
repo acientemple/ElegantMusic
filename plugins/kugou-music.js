@@ -946,6 +946,95 @@ module.exports = {
     },
 
     /**
+     * 伴奏版本候选（唱卡拉OK 时可以自己挑一个）。
+     * 与 getInstrumental 的区别是这里返回一批，让用户自己选
+     */
+    async getMusicInstrumentals(musicItem) {
+        const title = String(musicItem?.title || '').trim();
+        if (!title) {
+            return { isEnd: true, data: [] };
+        }
+        const duration = Number(musicItem?.duration) || 0;
+        const data = await getJson(SEARCH_API, {
+            keyword: `${title} 伴奏`,
+            page: 1,
+            pagesize: SEARCH_PAGE_SIZE,
+            platform: 'WebFilter',
+            userid: 0,
+            clientver: 2000,
+            iscorrection: 1,
+            privilege_filter: 0,
+            area_code: 1,
+            filter: 10,
+        }).catch(() => null);
+        const list = data?.data?.lists || [];
+
+        const candidates = list
+            .filter((song) =>
+                INSTRUMENTAL_MARKER.test(String(song?.SongName || '')),
+            )
+            .filter((song) => {
+                // 时长得跟原曲对得上，否则 karaoke 的时间轴会整个错位
+                const songDuration = Number(song?.Duration) || 0;
+                if (!duration || !songDuration) {
+                    return true;
+                }
+                const diff = Math.abs(songDuration - duration);
+                return diff <= Math.max(10, duration * 0.15);
+            })
+            .map((song) => ({
+                song,
+                score: instrumentalTitleScore(
+                    title,
+                    String(song?.SongName || ''),
+                    String(musicItem?.artist || ''),
+                    String(song?.SingerName || ''),
+                ),
+            }))
+            .sort((a, b) => b.score - a.score);
+
+        const items = [];
+        for (const item of candidates) {
+            const hash = item?.song?.FileHash;
+            if (!hash) {
+                continue;
+            }
+            const source = await fetchPlayUrl(hash);
+            if (!source?.url) {
+                continue;
+            }
+            const musicItem2 = toMusicItemFromSearch(item.song);
+            if (!musicItem2) {
+                continue;
+            }
+            items.push({
+                ...musicItem2,
+                url: source.url,
+                headers: {
+                    'user-agent': USER_AGENT,
+                    referer: 'https://www.kugou.com/',
+                },
+                isInstrumental: true,
+                isOriginArtist:
+                    String(musicItem?.artist || '').trim() !== '' &&
+                    String(item.song?.SingerName || '').trim() ===
+                        String(musicItem?.artist || '').trim(),
+                durationDelta: duration
+                    ? Math.round(
+                          Math.abs(
+                              (Number(item.song?.Duration) || 0) - duration,
+                          ),
+                      )
+                    : null,
+            });
+            if (items.length >= ALTERNATIVE_LIMIT) {
+                break;
+            }
+        }
+        return { isEnd: true, data: items };
+    },
+
+    /**
      * 伴奏版音源（唱卡拉OK 时放纯伴奏）。
      * 搜「歌名 伴奏」，挑一条标题确实带伴奏标记、时长又和原曲接近的
      */

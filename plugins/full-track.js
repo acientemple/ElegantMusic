@@ -50,10 +50,28 @@ const FULL_TIME_RATIO = 0.9;
 // 否则几十秒的片段会混进来。
 const MIN_DURATION_RATIO = 0.5;
 
+// 伴奏版本要跟原曲基本等长才算「完整版伴奏」，
+// 短于这个比例的多半是间奏片段或前奏。
+const INSTRUMENTAL_MIN_RATIO = 0.85;
+const INSTRUMENTAL_MAX_RATIO = 1.3;
+
+// 标题里带这些标记的才算伴奏
+const INSTRUMENTAL_MARKERS = [
+    '伴奏',
+    '纯音乐',
+    '纯器乐',
+    'instrumental',
+    'karaoke',
+    '卡拉ok',
+    '卡拉OK',
+];
+
+// 这些是伴奏的近亲，但更像改编演奏版，排在真正的伴奏后面
+const INSTRUMENTAL_LIKE_MARKERS = ['纯钢琴', '钢琴版', '钢琴曲', '钢琴伴奏'];
+
 // 伴奏、改编、加速慢速、儿童/冥想类衍生录音都不算「同一首歌的完整版」。
 // 这些噪音版本往往时长也接近原曲，光靠长度筛选会把它们排到前面。
-const NOISE_MARKERS = [
-    '伴奏',
+const NOISE_MARKERS = [    '伴奏',
     '纯音乐',
     '纯钢琴',
     '钢琴版',
@@ -583,6 +601,52 @@ function isSameArtist(song, origin) {
     return artistMatchLevel(song, origin) > 0;
 }
 
+// 标题里是不是带伴奏标记
+function instrumentalKind(title) {
+    const text = String(title || '').toLowerCase();
+    if (INSTRUMENTAL_MARKERS.some((marker) => text.includes(marker.toLowerCase()))) {
+        return 'instrumental';
+    }
+    if (
+        INSTRUMENTAL_LIKE_MARKERS.some((marker) =>
+            text.includes(marker.toLowerCase()),
+        )
+    ) {
+        return 'like';
+    }
+    return '';
+}
+
+// 去掉标题里的伴奏修饰，剩下的才是原曲名
+function stripInstrumentalTags(title) {
+    let text = String(title || '');
+    // 括号里的伴奏标记整段去掉
+    text = text.replace(/[（(\[【][^）)\]】]*[）)\]】]/g, (part) =>
+        instrumentalKind(part) ? '' : part,
+    );
+    // 裸露的标记词
+    INSTRUMENTAL_MARKERS.concat(INSTRUMENTAL_LIKE_MARKERS).forEach((marker) => {
+        text = text.split(marker).join(' ').split(marker.toLowerCase()).join(' ');
+    });
+    return text.replace(/\s+/g, ' ').trim();
+}
+
+// 去掉伴奏标记后，歌名是否还对得上原曲
+function instrumentalTitleMatches(originTitle, songName) {
+    const origin = normalizeTitle(stripInstrumentalTags(originTitle));
+    const candidate = normalizeTitle(stripInstrumentalTags(songName));
+    if (!origin || !candidate) {
+        return false;
+    }
+    if (origin === candidate) {
+        return true;
+    }
+    if (origin.length < 2 || candidate.length < 2) {
+        return false;
+    }
+    return candidate.startsWith(origin) || candidate.includes(origin);
+}
+
 // 单个引擎的一次检索。区分「引擎被拦」与「确实没有匹配」：
 // 前者要换引擎，后者是正常的空结果。
 async function searchByEngine(engine, query, limit, offset) {
@@ -780,6 +844,111 @@ async function pickFullTrack(songs, origin) {
         .filter(Boolean);
 }
 
+// 伴奏候选打分：歌名对得上、原唱唱的伴奏、时长接近原曲的排在前面
+function scoreInstrumental(song, origin) {
+    const originName = normalizeTitle(stripInstrumentalTags(origin?.title));
+    const name = normalizeTitle(stripInstrumentalTags(song?.name));
+    let score = 0;
+    if (originName && name === originName) {
+        score += 100;
+    } else if (originName && name.includes(originName)) {
+        score += 50;
+    }
+    // 原唱歌手发布的伴奏最对得上
+    if (artistMatchLevel(song, origin) === 2) {
+        score += 40;
+    } else if (artistMatchLevel(song, origin) === 1) {
+        score += 15;
+    }
+    // 真正的伴奏比钢琴改编更符合「唱卡拉OK」的用途
+    score += instrumentalKind(song?.name) === 'instrumental' ? 20 : 5;
+    const originDuration = Number(origin?.duration || 0);
+    if (originDuration > 0) {
+        score -= Math.abs(songDurationMs(song) / 1000 - originDuration) / 60;
+    }
+    return score;
+}
+
+// 挑出这首歌的伴奏版本。
+// 与完整版不同，这里要求标题带伴奏标记、时长与原曲接近，
+// 而且必须是完整可播的（试听片段不算「完整版伴奏」）。
+async function pickInstrumentalTrack(songs, origin) {
+    const originDuration = Number(origin?.duration || 0);
+    const seen = new Set();
+    const usable = (songs || []).filter((song) => {
+        if (!song?.id) {
+            return false;
+        }
+        if (!instrumentalKind(song.name)) {
+            return false;
+        }
+        if (!instrumentalTitleMatches(origin?.title, song.name)) {
+            return false;
+        }
+        if (originDuration > 0) {
+            const duration = songDurationMs(song) / 1000;
+            if (duration > 0) {
+                if (duration < originDuration * INSTRUMENTAL_MIN_RATIO) {
+                    return false;
+                }
+                if (duration > originDuration * INSTRUMENTAL_MAX_RATIO) {
+                    return false;
+                }
+            }
+        }
+        const key = [
+            String(song.name || ''),
+            pickArtistName(song),
+            Math.round(songDurationMs(song) / 1000),
+        ].join('|');
+        if (seen.has(key)) {
+            return false;
+        }
+        seen.add(key);
+        return true;
+    });
+    if (!usable.length) {
+        return [];
+    }
+    const sources = await fetchPlaySources(usable.map((song) => song.id));
+    const full = usable.filter((song) =>
+        isFullTrack(song, sources.get(String(song.id))),
+    );
+    full.sort((a, b) => scoreInstrumental(b, origin) - scoreInstrumental(a, origin));
+    return full
+        .map((song) => {
+            const item = toMusicItem(song);
+            if (!item) {
+                return null;
+            }
+            item.isOriginArtist = isSameArtist(song, origin);
+            item.isInstrumental = true;
+            item.durationDelta = originDuration
+                ? Math.round(Math.abs(songDurationMs(song) / 1000 - originDuration))
+                : null;
+            return item;
+        })
+        .filter(Boolean);
+}
+
+// 伴奏检索词：原曲名后面缀上「伴奏」，
+// 再补一条 instrumental，英文平台的伴奏往往用英文标。
+function buildInstrumentalQueries(title, artist) {
+    const queries = [];
+    const base = stripInstrumentalTags(title) || title;
+    queries.push(`${base} 伴奏`);
+    if (base !== title) {
+        queries.push(`${title} 伴奏`);
+    }
+    if (artist && !normalizeTitle(title).includes(normalizeTitle(artist))) {
+        queries.push(`${base} ${artist} 伴奏`);
+    }
+    queries.push(`${base} instrumental`);
+    return queries.filter(
+        (query, index) => query && queries.indexOf(query) === index,
+    );
+}
+
 // 只按歌名搜会大量漏掉原唱（翻唱挤在前面），
 // 因此组合「干净歌名 / 原歌名 / 歌名+歌手 / 歌手名」多种查询。
 function buildQueries(title, artist) {
@@ -800,7 +969,7 @@ function buildQueries(title, artist) {
 
 module.exports = {
     platform: PLATFORM,
-    version: '1.4.0',
+    version: '1.5.0',
     author: 'MusicFree',
     description:
         '网易云音乐完整版搜索：多引擎互备检索，只返回能整轨播放的歌曲，并可按歌名找出同一首歌的其他完整版本',
@@ -899,6 +1068,42 @@ module.exports = {
 
         // 检索词换过了，比对时也按新歌名来，原曲的 id/歌手/时长不变
         const data = await pickFullTrack(candidates, { ...musicItem, title });
+        return {
+            isEnd: true,
+            data: data.slice(0, ALTERNATIVE_LIMIT),
+        };
+    },
+
+    /**
+     * 查找这首歌的伴奏版本（唱卡拉OK 用）。
+     * 与「完整版」不同，这里要的是带伴奏标记、时长与原曲接近、
+     * 而且能整轨播放的伴奏，试听片段不算数。
+     */
+    async getMusicInstrumentals(musicItem, page, keyword) {
+        const title =
+            String(keyword ?? '').trim() || String(musicItem?.title || '').trim();
+        const artist = String(musicItem?.artist || '').trim();
+        if (!title) {
+            throw new Error('缺少歌曲名');
+        }
+
+        const collected = new Map();
+        for (const query of buildInstrumentalQueries(title, artist)) {
+            const result = await searchMulti(query, CANDIDATE_LIMIT).catch(
+                () => ({ songs: [], errors: [] }),
+            );
+            for (const song of result.songs || []) {
+                const id = String(song.id);
+                const previous = collected.get(id);
+                collected.set(id, previous ? mergeSong(previous, song) : song);
+            }
+        }
+
+        const candidates = Array.from(collected.values());
+        const data = await pickInstrumentalTrack(candidates, {
+            ...musicItem,
+            title,
+        });
         return {
             isEnd: true,
             data: data.slice(0, ALTERNATIVE_LIMIT),
