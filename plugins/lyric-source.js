@@ -87,6 +87,25 @@ async function httpGet(url, params, headers, deadline) {
     return parseMaybeJson(response.data);
 }
 
+async function httpPost(url, body, headers, deadline) {
+    const left = deadline ? deadline - Date.now() : REQUEST_TIMEOUT;
+    const timeout = Math.max(500, Math.min(REQUEST_TIMEOUT, left));
+    const response = await axios.post(url, body, {
+        headers: {
+            'user-agent': USER_AGENT,
+            'content-type': 'application/json',
+            ...(headers || {}),
+        },
+        timeout,
+    });
+    return parseMaybeJson(response.data);
+}
+
+/** 这段歌词里有没有词级时间戳（增强型 LRC 的 <mm:ss.xxx>） */
+function hasWordTimestamp(lrc) {
+    return /<\d{1,3}:\d{1,2}(?:[.:]\d{1,3})?>/.test(String(lrc || ''));
+}
+
 /* ------------------------------ 基础工具 ------------------------------ */
 
 /** 酷狗的歌词内容是 base64 的 */
@@ -373,6 +392,8 @@ async function fetchNeteaseLyric(sourceId, deadline) {
     return {
         rawLrc: data?.lrc?.lyric || '',
         translation: data?.tlyric?.lyric || '',
+        // 逐字歌词（yrc 格式）。网易云只在登录后才给，这里取到就用
+        wordLyric: data?.klyric?.lyric || '',
     };
 }
 
@@ -395,6 +416,34 @@ async function fetchQQLyric(sourceId, deadline) {
         rawLrc: data?.lyric || '',
         translation: data?.trans || '',
     };
+}
+
+/**
+ * QQ 的逐字歌词（qrc）。
+ * 这个接口必须带登录 cookie 才会给词级时间戳，
+ * cookie 由用户在插件的「用户变量」里配，取不到就当没有
+ */
+async function fetchQQWordLyric(sourceId, deadline) {
+    const cookie = String(getUserVariables().cookie || '').trim();
+    if (!cookie) {
+        return '';
+    }
+    const data = await httpPost(
+        'https://u.y.qq.com/cgi-bin/musicu.fcg',
+        {
+            comm: { ct: 11, cv: '20170008', uin: '0' },
+            req: {
+                method: 'get_qrc_lyric',
+                module: 'music.musichallSong.QrcSrv',
+                param: { songmid: sourceId },
+            },
+        },
+        { referer: 'https://y.qq.com/', cookie },
+        deadline,
+    );
+    const qrc = String(data?.req?.data?.qrc || '');
+    // qrc 的词级时间戳是 (start,duration,0)，跟行级歌词不是一回事，要单独判断
+    return /\(\d+,\d+(,\d+)?\)/.test(qrc) ? qrc : '';
 }
 
 /**
@@ -484,7 +533,13 @@ async function fetchKugouLyric(ref, deadline) {
     if (!rawLrc) {
         return null;
     }
-    return { rawLrc: cleanLyricHeader(rawLrc), translation: '' };
+    const cleaned = cleanLyricHeader(rawLrc);
+    return {
+        rawLrc: cleaned,
+        translation: '',
+        // 酷狗有些歌词本身就是带词级时间戳的增强格式
+        wordLyric: hasWordTimestamp(cleaned) ? cleaned : '',
+    };
 }
 
 async function fetchLrclibLyric(ref, deadline) {
@@ -507,6 +562,8 @@ async function fetchRefLyric(ref, deadline, target) {
             lyric = await fetchNeteaseLyric(ref.i, deadline);
         } else if (ref.s === 'qq') {
             lyric = await fetchQQLyric(ref.i, deadline);
+            // QQ 的逐字歌词单独取，行级接口不给
+            lyric.wordLyric = await fetchQQWordLyric(ref.i, deadline);
         } else if (ref.s === 'kugou') {
             lyric = await fetchKugouLyric(ref, deadline);
         } else if (ref.s === 'lrclib') {
@@ -823,7 +880,7 @@ async function searchAllSources(query, page, deadline) {
 
 module.exports = {
     platform: PLATFORM,
-    version: '1.2.0',
+    version: '1.3.0',
     author: 'MusicFree',
     module: '歌词',
     defaultSearchType: 'lyric',
@@ -909,8 +966,13 @@ module.exports = {
         }
 
         if (!best) {
-            return { rawLrc: NO_LYRIC_LRC, translation: '' };
+            return { rawLrc: NO_LYRIC_LRC, translation: '', wordLyric: '' };
         }
-        return best;
+        return {
+            rawLrc: best.rawLrc,
+            translation: best.translation || '',
+            // 逐字歌词：取到就用，取不到应用侧会按行均分生成
+            wordLyric: best.wordLyric || '',
+        };
     },
 };
