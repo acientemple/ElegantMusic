@@ -64,6 +64,28 @@ const INSTRUMENTAL_MARKERS = [
     'karaoke',
     '卡拉ok',
     '卡拉OK',
+    '卡啦ok',
+    '卡啦OK',
+    '伴唱',
+    '消音',
+    '消声',
+    'ktv',
+    'backing track',
+    'no vocals',
+    '人声消除',
+];
+
+// 卡拉OK伴唱标记：人声被分离出来当引导声，唱起来最合用。
+// 伴奏 / 纯音乐 / 消音 这些是「人声被整个拿掉」的纯器乐，
+// 一样能拿来唱，但不是伴唱轨，标签上要区分开
+const KARAOKE_MARKERS = [
+    'karaoke',
+    '卡拉ok',
+    '卡拉OK',
+    '卡啦ok',
+    '卡啦OK',
+    '伴唱',
+    'K歌',
 ];
 
 // 这些是伴奏的近亲，但更像改编演奏版，排在真正的伴奏后面
@@ -617,6 +639,33 @@ function instrumentalKind(title) {
     return '';
 }
 
+// 是不是卡拉OK伴唱：人声被分离出来当引导声
+function isKaraokeTitle(title) {
+    const text = String(title || '').toLowerCase();
+    return KARAOKE_MARKERS.some((marker) => text.includes(marker.toLowerCase()));
+}
+
+// 歌名或专辑名带伴唱标记都算伴唱资源
+function isKaraokeSong(song) {
+    if (isKaraokeTitle(song?.name)) {
+        return true;
+    }
+    return isKaraokeTitle(songAlbum(song)?.name);
+}
+
+// 网易云的 MV 标记：mvid 大于 0 说明这首歌配了 MV
+function hasMvResource(song) {
+    if (!song) {
+        return false;
+    }
+    const mvid = Number(song.mvid || 0);
+    if (mvid > 0) {
+        return true;
+    }
+    const mvId = Number(song.mv?.id || 0);
+    return mvId > 0;
+}
+
 // 去掉标题里的伴奏修饰，剩下的才是原曲名
 function stripInstrumentalTags(title) {
     let text = String(title || '');
@@ -862,6 +911,13 @@ function scoreInstrumental(song, origin) {
     }
     // 真正的伴奏比钢琴改编更符合「唱卡拉OK」的用途
     score += instrumentalKind(song?.name) === 'instrumental' ? 20 : 5;
+    // 人声可分离的伴唱、带 MV 的更合用
+    if (isKaraokeSong(song)) {
+        score += 30;
+    }
+    if (hasMvResource(song)) {
+        score += 15;
+    }
     const originDuration = Number(origin?.duration || 0);
     if (originDuration > 0) {
         score -= Math.abs(songDurationMs(song) / 1000 - originDuration) / 60;
@@ -926,13 +982,18 @@ async function pickInstrumentalTrack(songs, origin) {
             item.durationDelta = originDuration
                 ? Math.round(Math.abs(songDurationMs(song) / 1000 - originDuration))
                 : null;
+            // 卡拉OK伴唱：人声可以分离，唱起来最合用
+            item.isKaraoke = isKaraokeSong(song);
+            // 这首歌在网易云上配了 MV
+            item.hasMv = hasMvResource(song);
             return item;
         })
         .filter(Boolean);
 }
 
 // 伴奏检索词：原曲名后面缀上「伴奏」，
-// 再补一条 instrumental，英文平台的伴奏往往用英文标。
+// 再补几条 instrumental / karaoke，英文平台的伴奏往往用英文标，
+// 卡拉OK、伴唱这些词搜出来的才是真正能分开唱的版本。
 function buildInstrumentalQueries(title, artist) {
     const queries = [];
     const base = stripInstrumentalTags(title) || title;
@@ -944,6 +1005,9 @@ function buildInstrumentalQueries(title, artist) {
         queries.push(`${base} ${artist} 伴奏`);
     }
     queries.push(`${base} instrumental`);
+    queries.push(`${base} karaoke`);
+    queries.push(`${base} 卡啦OK`);
+    queries.push(`${base} 伴唱`);
     return queries.filter(
         (query, index) => query && queries.indexOf(query) === index,
     );
@@ -969,10 +1033,10 @@ function buildQueries(title, artist) {
 
 module.exports = {
     platform: PLATFORM,
-    version: '1.5.0',
+    version: '1.6.0',
     author: 'MusicFree',
     description:
-        '网易云音乐完整版搜索：多引擎互备检索，只返回能整轨播放的歌曲，并可按歌名找出同一首歌的其他完整版本',
+        '网易云音乐完整版搜索：多引擎互备检索，只返回能整轨播放的歌曲，并可按歌名找出同一首歌的其他完整版本；唱卡拉OK 时还能找出伴奏与卡拉OK伴唱版本',
     cacheControl: 'no-cache',
     supportedSearchType: ['music'],
     // 关联歌词时一并存下歌名与歌手，网易云没有歌词时能据此去别的平台找
