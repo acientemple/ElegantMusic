@@ -942,9 +942,101 @@ function toLrcTime(seconds) {
 // 渲染层随后读取 null.rawLrc 抛错，故用占位歌词兜底。
 const NO_LYRIC_LRC = '[00:00.00]暂无字幕';
 
+/* --------------------------- 伴奏候选检索 --------------------------- */
+
+/**
+ * 伴奏/卡拉OK 的标记词，命中任意一个才算伴奏候选。
+ * 这组词跟普通 MV 检索用的 EXCLUDE_WORDS 语义正好相反：
+ * EXCLUDE_WORDS 里「伴奏」「纯音乐」「KTV」是排除项，这里它们恰恰是准入项。
+ */
+const INSTRUMENTAL_MARK_RE =
+    /伴奏|卡啦OK|卡拉OK|karaoke|伴唱|纯音乐|instrumental|消音|消声|KTV|backing|no\s*vocals|人声消除/i;
+
+/**
+ * 明确表示「人声被分离出来当引导声」的标记，只有这类才算卡拉OK伴唱。
+ * 伴奏 / 纯音乐 / 消音 这些是「人声被整个拿掉」的纯器乐，
+ * 唱起来一样能用，但不是伴唱轨，标签上要区分开。
+ */
+const KARAOKE_MARK_RE = /伴唱|karaoke|卡啦\s*ok|卡拉\s*ok|K歌/i;
+
+/** 教学、谱子这类视频标题里也带「伴奏」，但不是能拿来唱的伴唱，要挡掉 */
+const INSTRUMENTAL_EXCLUDE_RE =
+    /教学|教程|扒谱|曲谱|简谱|工尺谱|乐谱|鼓谱|琴谱|怎么唱|如何唱|练习/;
+
+/** 伴奏候选的检索词后缀，中英文各种写法都覆盖 */
+const INSTRUMENTAL_SUFFIXES = [
+    '伴奏',
+    '卡啦OK',
+    '卡拉OK',
+    'karaoke',
+    '纯音乐',
+    'instrumental',
+    '消音',
+    '消声',
+    '伴唱',
+];
+
+/** 一次伴奏检索用几个关键词 */
+const INSTRUMENTAL_KEYWORD_LIMIT = 10;
+/** 排在前面的几个关键词再补一轮全站搜索 */
+const INSTRUMENTAL_DEEP_KEYWORDS = 4;
+
+/**
+ * 伴奏候选的检索词矩阵：歌名（或用户自定义词）后面各挂一个标记词。
+ */
+function buildInstrumentalKeywords(base, limit) {
+    const text = String(base || '').replace(/\s+/g, ' ').trim();
+    if (!text) {
+        return [];
+    }
+    const list = [];
+    INSTRUMENTAL_SUFFIXES.forEach((suffix) => {
+        const value = `${text} ${suffix}`;
+        if (!list.includes(value)) {
+            list.push(value);
+        }
+    });
+    return list.slice(0, limit);
+}
+
+/**
+ * 时长允许的最大偏差：至少 10 秒，或者原曲时长的 15%，取大者。
+ * 原曲时长未知时返回 null，表示不按时长过滤。
+ */
+function instrumentalDurationTolerance(songDuration) {
+    const song = Number(songDuration);
+    if (!Number.isFinite(song) || song <= 0) {
+        return null;
+    }
+    return Math.max(10, song * 0.15);
+}
+
+/**
+ * 候选是不是原唱歌手的版本。
+ * 标题里写了歌手名是最强信号，UP 主名里带歌手名也算数（写法很杂，逐个变体都试一遍）。
+ */
+function candidateHasArtist(video, artist) {
+    const variants = artistVariants(artist);
+    if (!variants.length) {
+        return false;
+    }
+    const artistKey = normalizeText(variants[0]);
+    if (artistKey && titleHasArtist(video, artistKey)) {
+        return true;
+    }
+    const authorKey = normalizeText(video?.author);
+    if (!authorKey) {
+        return false;
+    }
+    return variants.some((variant) => {
+        const key = normalizeText(variant);
+        return key.length >= 2 && authorKey.includes(key);
+    });
+}
+
 module.exports = {
     platform: PLATFORM,
-    version: '1.2.0',
+    version: '1.3.0',
     author: 'MusicFree',
     module: '搜索',
     defaultSearchType: 'music',
@@ -1285,6 +1377,145 @@ module.exports = {
                 return toMusicItem(item.video);
             })
             .filter(Boolean);
+        return {
+            isEnd: data.length === 0,
+            data,
+        };
+    },
+
+    /**
+     * 按歌曲找伴奏 / 卡拉OK候选。
+     *
+     * 与 getMusicVideoCandidates 的关键区别：
+     *  - 这里不能走 isSingleMv()，它会把「伴奏」「纯音乐」「KTV」当成排除词全筛掉；
+     *    所以这里直接用 searchVideos 的原始结果，自己做标记词准入判断。
+     *  - 候选的 id 是 BV 号，被选中后可以直接交给 getMediaSource 取音频流。
+     *  - 额外带上 isKaraoke（人声可分离）与 hasMv（B 站天然带画面）两个标记。
+     */
+    async getMusicInstrumentals(musicItem, page, keyword) {
+        // 用户可以在界面上改检索词，改了就用他给的词替换歌名
+        const custom = String(keyword ?? '').trim();
+        const title = String(musicItem?.title ?? '').trim();
+        const artist = String(musicItem?.artist ?? '').trim();
+        const base = custom || title;
+        if (!base) {
+            return {isEnd: true, data: []};
+        }
+        const current = Math.max(1, Number(page) || 1);
+        const songDuration = Number(musicItem?.duration);
+        const hasSongDuration = Number.isFinite(songDuration) && songDuration > 0;
+        const tolerance = instrumentalDurationTolerance(songDuration);
+
+        const keywords = buildInstrumentalKeywords(base, INSTRUMENTAL_KEYWORD_LIMIT);
+        if (!keywords.length) {
+            return {isEnd: true, data: []};
+        }
+
+        // 检索任务：音乐分区里伴奏最集中，前几个关键词再补一轮全站搜索兜底
+        const tasks = [];
+        keywords.forEach((word, index) => {
+            tasks.push({keyword: word, page: current, tid: MUSIC_TID});
+            if (index < INSTRUMENTAL_DEEP_KEYWORDS) {
+                tasks.push({keyword: word, page: current});
+            }
+        });
+
+        const resultLists = await mapWithLimit(
+            tasks,
+            CANDIDATE_CONCURRENCY,
+            async (task) => {
+                try {
+                    return await searchVideos(
+                        task.keyword,
+                        task.page,
+                        task.tid ? {tids: task.tid} : undefined,
+                    );
+                } catch (e) {
+                    return [];
+                }
+            },
+        );
+
+        const seen = new Set();
+        const merged = [];
+        for (const results of resultLists) {
+            for (const video of results) {
+                if (!video?.bvid || seen.has(video.bvid)) {
+                    continue;
+                }
+                seen.add(video.bvid);
+                // 收费/付费视频取不到可播放的音频流，直接挡掉
+                if (video.is_pay || video.is_charge_video) {
+                    continue;
+                }
+                const rawTitle = stripHtml(video.title);
+                // 准入条件：标题必须命中伴奏/卡拉OK标记词
+                if (!INSTRUMENTAL_MARK_RE.test(rawTitle)) {
+                    continue;
+                }
+                if (INSTRUMENTAL_EXCLUDE_RE.test(rawTitle)) {
+                    continue;
+                }
+                const duration = parseDuration(video.duration);
+                // 时长都拿不到，既没法比对也没法确认是完整版
+                if (!duration || duration > MAX_DURATION) {
+                    continue;
+                }
+                if (hasSongDuration && Math.abs(duration - songDuration) > tolerance) {
+                    continue;
+                }
+                if (!isFullLength(video, songDuration)) {
+                    continue;
+                }
+                merged.push(video);
+            }
+        }
+
+        const candidates = merged
+            .map((video) => {
+                const item = toMusicItem(video);
+                if (!item) {
+                    return null;
+                }
+                const duration = parseDuration(video.duration);
+                return {
+                    ...item,
+                    // 主进程会用插件名改写 platform，这里先填自己的平台
+                    platform: PLATFORM,
+                    isOriginArtist: candidateHasArtist(video, artist),
+                    durationDelta: hasSongDuration
+                        ? Math.abs(duration - songDuration)
+                        : null,
+                    isKaraoke: KARAOKE_MARK_RE.test(stripHtml(video.title)),
+                    // B 站是视频平台，候选天然带 MV 画面
+                    hasMv: true,
+                };
+            })
+            .filter(Boolean);
+
+        // 卡拉OK伴唱优先 → 原唱歌手优先 → 时长差小的优先 → 标题字典序
+        candidates.sort((a, b) => {
+            if (a.isKaraoke !== b.isKaraoke) {
+                return a.isKaraoke ? -1 : 1;
+            }
+            if (a.isOriginArtist !== b.isOriginArtist) {
+                return a.isOriginArtist ? -1 : 1;
+            }
+            const deltaA = a.durationDelta == null ? Number.POSITIVE_INFINITY : a.durationDelta;
+            const deltaB = b.durationDelta == null ? Number.POSITIVE_INFINITY : b.durationDelta;
+            if (deltaA !== deltaB) {
+                return deltaA - deltaB;
+            }
+            if (a.title < b.title) {
+                return -1;
+            }
+            if (a.title > b.title) {
+                return 1;
+            }
+            return 0;
+        });
+
+        const data = candidates.slice(0, CANDIDATE_LIMIT);
         return {
             isEnd: data.length === 0,
             data,
