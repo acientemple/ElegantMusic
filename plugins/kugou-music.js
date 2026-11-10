@@ -45,7 +45,13 @@ const LRCLIB_API = 'https://lrclib.net/api/get';
 
 /** 伴奏版标题里常见的标记 */
 const INSTRUMENTAL_MARKER =
-    /伴奏|纯音乐|纯歌|纯钢琴|钢琴伴奏|人声伴奏|instrumental|karaoke|卡拉\s*ok/i;
+    /伴奏|纯音乐|纯歌|纯钢琴|钢琴伴奏|人声伴奏|instrumental|karaoke|卡拉\s*ok|卡啦\s*ok|伴唱|消音|消声|ktv|backing|no\s+vocals|人声消除/i;
+
+/**
+ * 卡拉OK伴唱标记：人声被分离出来当引导声。伴奏 / 纯音乐 / 消音 这些是
+ * 「人声被整个拿掉」的纯器乐，一样能拿来唱，但不是伴唱轨，标签上要区分开
+ */
+const KARAOKE_MARKER = /karaoke|卡拉\s*ok|卡啦\s*ok|伴唱|K歌/i;
 
 const RANK_PAGE_SIZE = 50;
 const SEARCH_PAGE_SIZE = 30;
@@ -746,6 +752,43 @@ function buildAlternativeQueries(title, artist) {
     return queries.filter((query, index) => query && queries.indexOf(query) === index);
 }
 
+/**
+ * 伴奏候选的检索词。
+ * 除了「伴奏」，卡拉OK / 伴唱 / 消音 这些词搜出来的才是真正能分开唱的版本
+ */
+function buildInstrumentalQueries(title, artist) {
+    const base = String(title || '').trim();
+    if (!base) {
+        return [];
+    }
+    const suffixes = ['伴奏', '卡啦OK', 'karaoke', '伴唱', '纯音乐', 'instrumental'];
+    const queries = suffixes.map((suffix) => `${base} ${suffix}`);
+    // 原唱歌手自己发的伴奏最合用，单独再搜一次
+    if (
+        artist &&
+        !base.toLowerCase().includes(String(artist).toLowerCase())
+    ) {
+        queries.push(`${base} ${artist} 伴奏`);
+    }
+    return queries.filter(
+        (query, index) => query && queries.indexOf(query) === index,
+    );
+}
+
+/** 酷狗的 MV 标记：有 MvHash / MvType 就说明这首歌配了 MV */
+function hasMvResource(song) {
+    if (!song) {
+        return false;
+    }
+    if (String(song.MvHash || '').trim()) {
+        return true;
+    }
+    if (String(song.vvid || '').trim()) {
+        return true;
+    }
+    return Number(song.MvType || 0) > 0;
+}
+
 /** 检索歌曲，返回酷狗搜索接口的原始条目 */
 async function searchSongs(keyword, limit) {
     const data = await getJson(SEARCH_API, {
@@ -837,11 +880,12 @@ async function pickFullTracks(candidates, origin) {
 /* ---------------------------- 插件 ---------------------------- */
 
 module.exports = {
-    version: '1.3.0',
+    version: '1.4.0',
     module: '榜单',
     platform: PLATFORM,
     author: '',
-    description: '酷狗音乐榜单、搜索与完整版搜索',
+    description:
+        '酷狗音乐榜单、搜索与完整版搜索，唱卡拉OK 时能找出伴奏与卡拉OK伴唱版本',
     website: 'https://www.kugou.com/',
     defaultSearchType: 'music',
     supportedSearchType: ['music', 'album', 'artist', 'lyric'],
@@ -947,29 +991,32 @@ module.exports = {
 
     /**
      * 伴奏版本候选（唱卡拉OK 时可以自己挑一个）。
-     * 与 getInstrumental 的区别是这里返回一批，让用户自己选
+     * 与 getInstrumental 的区别是这里返回一批，让用户自己选。
+     * 优先给「人声可分离」与「带 MV」的资源
      */
-    async getMusicInstrumentals(musicItem) {
-        const title = String(musicItem?.title || '').trim();
+    async getMusicInstrumentals(musicItem, page, keyword) {
+        const title =
+            String(keyword ?? '').trim() || String(musicItem?.title || '').trim();
+        const artist = String(musicItem?.artist || '').trim();
         if (!title) {
             return { isEnd: true, data: [] };
         }
         const duration = Number(musicItem?.duration) || 0;
-        const data = await getJson(SEARCH_API, {
-            keyword: `${title} 伴奏`,
-            page: 1,
-            pagesize: SEARCH_PAGE_SIZE,
-            platform: 'WebFilter',
-            userid: 0,
-            clientver: 2000,
-            iscorrection: 1,
-            privilege_filter: 0,
-            area_code: 1,
-            filter: 10,
-        }).catch(() => null);
-        const list = data?.data?.lists || [];
 
-        const candidates = list
+        // 多个检索词的结果按 FileHash 合并
+        const collected = new Map();
+        for (const query of buildInstrumentalQueries(title, artist)) {
+            const list = await searchSongs(query, SEARCH_PAGE_SIZE);
+            for (const song of list) {
+                const hash = String(song?.FileHash || '');
+                if (!hash || collected.has(hash)) {
+                    continue;
+                }
+                collected.set(hash, song);
+            }
+        }
+
+        const candidates = Array.from(collected.values())
             .filter((song) =>
                 INSTRUMENTAL_MARKER.test(String(song?.SongName || '')),
             )
@@ -982,15 +1029,27 @@ module.exports = {
                 const diff = Math.abs(songDuration - duration);
                 return diff <= Math.max(10, duration * 0.15);
             })
-            .map((song) => ({
-                song,
-                score: instrumentalTitleScore(
-                    title,
+            .map((song) => {
+                const isKaraoke = KARAOKE_MARKER.test(
                     String(song?.SongName || ''),
-                    String(musicItem?.artist || ''),
-                    String(song?.SingerName || ''),
-                ),
-            }))
+                );
+                const hasMv = hasMvResource(song);
+                return {
+                    song,
+                    isKaraoke,
+                    hasMv,
+                    score:
+                        instrumentalTitleScore(
+                            title,
+                            String(song?.SongName || ''),
+                            artist,
+                            String(song?.SingerName || ''),
+                        ) +
+                        // 人声可分离的更合用，带 MV 的再往前挪一挪
+                        (isKaraoke ? 30 : 0) +
+                        (hasMv ? 15 : 0),
+                };
+            })
             .sort((a, b) => b.score - a.score);
 
         const items = [];
@@ -1026,6 +1085,10 @@ module.exports = {
                           ),
                       )
                     : null,
+                // 卡拉OK伴唱：人声可以分离，跟着唱更合用
+                isKaraoke: item.isKaraoke,
+                // 这首歌在酷狗上配了 MV
+                hasMv: item.hasMv,
             });
             if (items.length >= ALTERNATIVE_LIMIT) {
                 break;
