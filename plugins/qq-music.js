@@ -794,6 +794,228 @@ async function pickFullTracks(candidates, origin) {
 }
 
 
+/* ---------------------------- 伴奏候选 ---------------------------- */
+
+/** 伴奏检索时每个检索词取多少条 */
+const INSTRUMENTAL_QUERY_LIMIT = 30;
+/**
+ * 伴奏标记词：歌名或专辑名命中任意一个，才算伴奏 / 卡拉OK 资源。
+ * 写成不区分大小写的正则，Karaoke / Instrumental / KTV 都能命中。
+ */
+const INSTRUMENTAL_MARKER_RE =
+    /伴奏|卡啦OK|卡拉OK|karaoke|K歌|伴唱|纯音乐|instrumental|消音|消声|伴奏版|KTV|和声伴奏|backing track|no vocals/i;
+/**
+ * 伴唱类标记：带这些词的资源是「人声可分离」的卡拉OK 伴唱轨。
+ * 消音 / 消声 / no vocals 属于纯器乐（人声被拿掉），不算伴唱。
+ */
+const KARAOKE_MARKER_RE = /karaoke|卡啦OK|卡拉OK|K歌|伴唱/i;
+/**
+ * 纯器乐标记：歌名里明写着伴奏 / 纯音乐 / instrumental 时，
+ * 就算专辑名带 Karaoke 也只是该专辑里的伴奏轨，不算伴唱资源。
+ */
+const INSTRUMENTAL_ONLY_MARKER_RE =
+    /伴奏|纯音乐|纯器乐|instrumental|消音|消声|no vocals/i;
+/**
+ * MV 标记：匹配独立成词的 MV / M.V.（放过 AMV、MV4、Video 这类蹭词）。
+ * 中文不算 \w，所以「官方MV」「MV版伴奏」「不MV的」都能命中。
+ */
+const MV_MARKER_RE = /(?:^|[^\w])m\.?v\.?(?!\w)/i;
+
+/** 歌名或专辑名里是不是带伴奏标记 */
+function hasInstrumentalMarker(song) {
+    const text = `${song?.songname || ''} ${song?.albumname || ''}`;
+    return INSTRUMENTAL_MARKER_RE.test(text);
+}
+
+/**
+ * 是不是卡拉OK 伴唱（人声可分离）资源。
+ * 歌名优先于专辑名：歌名明写「伴奏 / 纯音乐 / instrumental」时，
+ * 哪怕专辑名带 Karaoke，也只是该专辑里的纯伴奏轨，不算伴唱。
+ */
+function isKaraokeResource(song) {
+    const title = String(song?.songname || '');
+    const album = String(song?.albumname || '');
+    if (KARAOKE_MARKER_RE.test(title)) {
+        return true;
+    }
+    if (INSTRUMENTAL_ONLY_MARKER_RE.test(title)) {
+        return false;
+    }
+    return KARAOKE_MARKER_RE.test(album);
+}
+
+/**
+ * 是不是带 MV 的资源。
+ * 限制：QQ 的歌曲搜索接口拿不到 MV 关联信息（返回的 vid 绝大多数是空串，
+ * fcg_v8_mvurl.fcg / musicMac 的 mv_info.json 均已 404，
+ * musicu.fcg 的 music.videoInfo 与 MvService.MvInfoProServer 也取不到数据），
+ * 所以 hasMv 只能靠歌名 / 专辑名里的 MV 字样加上 vid 字段来判断，属于弱信号，
+ * 会有漏判（关联了 MV 但标题没写）和误判（标题里带 MV 字样但其实没有画面）。
+ */
+function hasMvResource(song) {
+    if (String(song?.vid || '').trim()) {
+        return true;
+    }
+    const text = `${song?.songname || ''} ${song?.albumname || ''}`;
+    return MV_MARKER_RE.test(text);
+}
+
+/** 候选歌手与原曲歌手是否同名（两边都非空才算） */
+function isSameArtist(candidateArtist, originArtist) {
+    const left = normalizeTitle(candidateArtist);
+    const right = normalizeTitle(originArtist);
+    return Boolean(left) && Boolean(right) && left === right;
+}
+
+/**
+ * 候选歌名与原曲是否相关。
+ * normalizeTitle 会去掉括号里的伴奏标记，所以「My Love (伴奏)」与「My Love」归一化后一致。
+ * 只认「候选以原歌名开头」或「原歌名以候选开头」，
+ * 双向 contains 会把「Love」当成「Love Story」。
+ */
+function isRelatedTitle(originTitle, candidateTitle) {
+    const origin = normalizeTitle(originTitle);
+    const candidate = normalizeTitle(candidateTitle);
+    if (!origin || !candidate) {
+        return false;
+    }
+    if (origin === candidate) {
+        return true;
+    }
+    if (origin.length < 2 || candidate.length < 2) {
+        return false;
+    }
+    return candidate.startsWith(origin) || origin.startsWith(candidate);
+}
+
+/**
+ * 伴奏检索词：歌名后面缀上各类标记，再补上带歌手的组合。
+ * 用户自定义检索词只替换歌名部分，歌手仍取原曲。
+ */
+function buildInstrumentalQueries(title, artist) {
+    const base = String(title || '').trim();
+    if (!base) {
+        return [];
+    }
+    const suffixes = ['伴奏', 'Karaoke', '卡啦OK', '伴唱', '纯音乐', 'instrumental'];
+    const queries = suffixes.map((suffix) => `${base} ${suffix}`);
+    if (artist && !normalizeTitle(base).includes(normalizeTitle(artist))) {
+        queries.push(`${base} ${artist} 伴奏`);
+        queries.push(`${base} ${artist} Karaoke`);
+    }
+    return queries.filter((query, index) => query && queries.indexOf(query) === index);
+}
+
+/**
+ * 挑出能整轨播放的伴奏候选，并带上 isKaraoke / hasMv 标记。
+ * 过滤顺序：伴奏标记 → 时长接近原曲 → 歌名相关 → 播放能力实测。
+ */
+async function pickInstrumentalTracks(candidates, origin) {
+    const originDuration = Number(origin?.duration || 0);
+    const originArtist = String(origin?.artist || '').trim();
+    const originId = origin?.platform === PLATFORM ? String(origin?.id || '') : '';
+    // 时长差阈值：至少 10 秒，或原曲时长的 15%
+    const durationTolerance = Math.max(10, originDuration * 0.15);
+
+    const usable = [];
+    for (const song of candidates) {
+        const mid = String(song?.songmid || '');
+        if (!mid || mid === originId) {
+            continue;
+        }
+        // 必须是伴奏 / 卡拉OK 资源
+        if (!hasInstrumentalMarker(song)) {
+            continue;
+        }
+        const duration = Math.round(Number(song.interval) || 0);
+        // 时长必须跟原曲接近；原曲时长未知时不按时长过滤
+        if (originDuration > 0 && Math.abs(duration - originDuration) > durationTolerance) {
+            continue;
+        }
+        usable.push({
+            song,
+            mid,
+            duration,
+            isKaraoke: isKaraokeResource(song),
+            hasMv: hasMvResource(song),
+            isOriginArtist: isSameArtist(pickSingerName(song.singer), originArtist),
+            durationDelta: originDuration
+                ? Math.round(Math.abs(duration - originDuration))
+                : null,
+        });
+    }
+    if (!usable.length) {
+        return [];
+    }
+
+    // 歌名相关的候选优先；一个都没有时放宽，避免检索词换了写法就颗粒无收
+    const related = usable.filter((entry) => isRelatedTitle(origin?.title, entry.song.songname));
+    const pool = related.length ? related : usable;
+
+    // 排序：伴唱优先 → 原唱歌手优先 → 时长差小的优先 → 歌名
+    pool.sort((a, b) => {
+        if (a.isKaraoke !== b.isKaraoke) {
+            return a.isKaraoke ? -1 : 1;
+        }
+        if (a.isOriginArtist !== b.isOriginArtist) {
+            return a.isOriginArtist ? -1 : 1;
+        }
+        const deltaA = a.durationDelta === null ? Number.MAX_SAFE_INTEGER : a.durationDelta;
+        const deltaB = b.durationDelta === null ? Number.MAX_SAFE_INTEGER : b.durationDelta;
+        if (deltaA !== deltaB) {
+            return deltaA - deltaB;
+        }
+        const titleA = String(a.song.songname || '');
+        const titleB = String(b.song.songname || '');
+        if (titleA === titleB) {
+            return 0;
+        }
+        return titleA < titleB ? -1 : 1;
+    });
+
+    // 实测前若干个候选的可播长度。取流接口本身时不时的抽风，
+    // 探测只是尽力而为，不能因为探测失败就把整个源清空，
+    // 真播不了的时候在取音源那一步会明确报错
+    const ranked = pool.slice(0, ALTERNATIVE_PROBE_LIMIT);
+    const measured = await mapWithLimit(ranked, ALTERNATIVE_PROBE_CONCURRENCY, (entry) =>
+        measurePlayableLength(entry.mid),
+    );
+    const verified = [];
+    const unverified = [];
+    ranked.forEach((entry, index) => {
+        const probe = measured[index] || { playable: 0, hasUrl: false };
+        if (!probe.hasUrl) {
+            // 探测不出音源，先留着，选中时再验
+            unverified.push(entry);
+            return;
+        }
+        const playable = probe.playable > 0 ? probe.playable : declaredLength(entry.song);
+        // 音源长度要能对上这首歌自己的时长，否则只是同名片段
+        if (entry.duration > 0 && playable > 0 && playable / entry.duration < FULL_TRACK_RATIO) {
+            return;
+        }
+        verified.push(entry);
+    });
+    // 没轮到探测的候选也留着，排在已验证的后面
+    unverified.push(...pool.slice(ALTERNATIVE_PROBE_LIMIT));
+    const full = [...verified, ...unverified];
+
+    return full
+        .map((entry) => {
+            const item = toMusicItem(entry.song);
+            if (!item) {
+                return null;
+            }
+            item.isOriginArtist = entry.isOriginArtist;
+            item.durationDelta = entry.durationDelta;
+            item.isKaraoke = entry.isKaraoke;
+            item.hasMv = entry.hasMv;
+            return item;
+        })
+        .filter(Boolean);
+}
+
+
 /* ---------------------------- 链接解析 ---------------------------- */
 
 function extractSongMid(input) {
@@ -831,9 +1053,9 @@ function extractDissId(input) {
 
 module.exports = {
     platform: PLATFORM,
-    version: '1.1.0',
+    version: '1.2.0',
     author: 'MusicFree',
-    description: 'QQ音乐榜单与热门歌单：榜单分类浏览、歌单曲目、在线播放、歌词与完整版搜索',
+    description: 'QQ音乐榜单与热门歌单：榜单分类浏览、歌单曲目、在线播放、歌词、完整版搜索与伴奏候选',
     module: '榜单',
     defaultSearchType: 'music',
     supportedSearchType: ['music', 'album', 'artist', 'lyric'],
@@ -1019,6 +1241,51 @@ module.exports = {
 
         // 检索词换过了，比对时也按新歌名来，原曲的 id/歌手/时长不变
         const data = await pickFullTracks(candidates, { ...musicItem, title });
+        return {
+            isEnd: true,
+            data: data.slice(0, ALTERNATIVE_LIMIT),
+        };
+    },
+
+    /**
+     * 伴奏候选（唱卡拉OK 用）。
+     * 与「完整版」不同，这里要的是带伴奏标记、时长与原曲接近、
+     * 而且能整轨播放的伴奏，试听片段不算数。
+     * 每个候选额外带 isKaraoke（人声可分离的伴唱轨）与 hasMv（带 MV 画面）两个标记。
+     */
+    async getMusicInstrumentals(musicItem, page, keyword) {
+        // 用户可以自定义检索词，替换掉默认的歌名；歌手与时长基准仍取原曲
+        const title = String(keyword ?? '').trim() || String(musicItem?.title || '').trim();
+        const artist = String(musicItem?.artist || '').trim();
+        if (!title) {
+            throw new Error('缺少歌曲名');
+        }
+
+        const collected = new Map();
+        let alive = false;
+        for (const query of buildInstrumentalQueries(title, artist)) {
+            const list = await searchSongs(query, INSTRUMENTAL_QUERY_LIMIT);
+            if (list.length) {
+                alive = true;
+            }
+            for (const song of list) {
+                const mid = String(song?.songmid || '');
+                if (!mid) {
+                    continue;
+                }
+                const previous = collected.get(mid);
+                collected.set(mid, previous ? { ...previous, ...song } : song);
+            }
+        }
+        if (!alive) {
+            throw new Error('搜索接口暂时不可用');
+        }
+
+        // 检索词换过了，比对时也按新歌名来，原曲的 id/歌手/时长不变
+        const data = await pickInstrumentalTracks(Array.from(collected.values()), {
+            ...musicItem,
+            title,
+        });
         return {
             isEnd: true,
             data: data.slice(0, ALTERNATIVE_LIMIT),
